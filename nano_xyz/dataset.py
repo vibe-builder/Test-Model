@@ -43,15 +43,28 @@ class TextFileDataset(Dataset):
 
         # Read and tokenize file(s)
         print(f"Loading and tokenizing {file_path}...")
+        import time
+        start_time = time.time()
+
         text = self._load_text(file_path, chunk_size)
+        load_time = time.time() - start_time
+        print(".2f")
 
         # Tokenize entire text
+        tokenize_start = time.time()
         self.tokens = self.processor.encode(text)
-        print(f"Tokenized {len(self.tokens)} tokens")
+        tokenize_time = time.time() - tokenize_start
+        print(f"Tokenized {len(self.tokens)} tokens in {tokenize_time:.2f}s "
+              f"({len(self.tokens)/tokenize_time:.0f} tokens/sec)")
 
         # Create chunks
+        chunk_start = time.time()
         self.chunks = self._create_chunks()
-        print(f"Created {len(self.chunks)} chunks of size {block_size}")
+        chunk_time = time.time() - chunk_start
+        print(f"Created {len(self.chunks)} chunks of size {block_size} in {chunk_time:.2f}s")
+
+        total_time = time.time() - start_time
+        print(".2f")
 
     def _load_text(self, file_path: str, chunk_size: Optional[int] = None) -> str:
         """Load text from file or directory."""
@@ -72,7 +85,15 @@ class TextFileDataset(Dataset):
                         print(f"Warning: Could not read {filename}: {e}")
             return ' '.join(texts)
         else:
-            # Load from single file
+            # Load from single file - show file size for large files
+            file_size = os.path.getsize(file_path)
+            if file_size > 500 * 1024 * 1024:  # > 500MB
+                print(".2f")
+            elif file_size > 100 * 1024 * 1024:  # > 100MB
+                print(".2f")
+            elif file_size > 10 * 1024 * 1024:  # > 10MB
+                print(".2f")
+
             with open(file_path, 'r', encoding='utf-8') as f:
                 return f.read(chunk_size) if chunk_size else f.read()
     
