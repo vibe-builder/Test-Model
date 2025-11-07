@@ -9,7 +9,7 @@
 
 import torch
 from torch.utils.data import Dataset, DataLoader
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 import logging
 
 from .processor import TextProcessor
@@ -470,11 +470,13 @@ class TextFileDataset(Dataset):
             return {"cached_chunks": 0, "cache_size_limit": 0}
 
         cache_memory = sum(len(tokens) * 4 for tokens in self.token_cache.values())  # Rough estimate: 4 bytes per token
+        cache_accesses = getattr(self, '_cache_accesses', 0)
+        cache_hit_rate = getattr(self, '_cache_hits', 0) / cache_accesses if cache_accesses > 0 else 0.0
         return {
             "cached_chunks": len(self.token_cache),
             "cache_size_limit": self.cache_size_limit,
             "estimated_cache_memory_mb": cache_memory / (1024 * 1024),
-            "cache_hit_rate": getattr(self, '_cache_hits', 0) / max(getattr(self, '_cache_accesses', 1), 1)
+            "cache_hit_rate": cache_hit_rate
         }
 
 
