@@ -71,7 +71,7 @@ class TextGenerator:
         logger.info(f"Model initialized on device: {self.device}")
 
     def generate(self, token_ids: torch.Tensor,
-                max_new_tokens: int,
+                max_new_tokens: Optional[int] = None,
                 temperature: float = 1.0,
                 top_k: Optional[int] = None,
                 top_p: Optional[float] = None,
@@ -80,7 +80,7 @@ class TextGenerator:
 
         Args:
             token_ids: Input token sequence of shape (batch_size, seq_len)
-            max_new_tokens: Maximum number of new tokens to generate
+            max_new_tokens: Maximum number of new tokens to generate (auto-fills to remaining context if None)
             temperature: Sampling temperature (controls randomness, clipped to [0.1, 5.0])
             top_k: Limit sampling to top-k most likely tokens (None = no limit)
             top_p: Nucleus sampling probability mass (None = no nucleus sampling)
@@ -232,95 +232,99 @@ class TextGenerator:
                 _trim_context()
                 return logits_chunk
 
-            # Efficiently ingest any overflow tokens before sampling
-            if overflow_tokens.numel() > 0:
-                chunk_size = min(self.config.block_size, overflow_tokens.size(1))
-                for start in range(0, overflow_tokens.size(1), chunk_size):
-                    chunk = overflow_tokens[:, start:start + chunk_size]
-                    current_logits = _ingest_chunk(chunk)
-                    if current_logits is None:
-                        return token_ids
-
-            if max_new_tokens <= 0:
-                return token_ids
-
-            step_index = 0
-            generated = 0
-
-            def advance(next_token: torch.Tensor, step_idx: int, forced: bool) -> Optional[torch.Tensor]:
-                nonlocal past_key_values, token_ids, absolute_pos, use_cache
-                try:
-                    with amp_context(self.config, self.device):
-                        position_ids_inner = torch.arange(
-                            absolute_pos,
-                            absolute_pos + next_token.size(1),
-                            device=self.device,
-                        ).unsqueeze(0)
-                        result_inner = self.model(
-                            next_token,
-                            use_cache=use_cache,
-                            position_ids=position_ids_inner,
-                            past_key_values=past_key_values,
-                            return_full_logits=False,
-                        )
-                        if len(result_inner) == 3:
-                            logits_step, _, past_key_values_inner = result_inner
-                        else:
-                            logits_step, _ = result_inner
-                            past_key_values_inner = None
-                    past_key_values = past_key_values_inner
-                except torch.cuda.OutOfMemoryError:
-                    torch.cuda.empty_cache()
-                    logger.warning("OOM detected during generation; cleared cache and skipping this step")
-                    return None
-
-                token_ids = torch.cat((token_ids, next_token), dim=1)
-                absolute_pos += next_token.size(1)
-                _trim_context()
-
-                if logger.isEnabledFor(logging.DEBUG):
-                    cache_lengths = [kv[0].shape[2] for kv in past_key_values] if past_key_values else []
-                    logger.debug(
-                        "Step %d (%s): tokens=%d cache=%s",
-                        step_idx,
-                        "forced" if forced else "sampled",
-                        token_ids.size(1),
-                        cache_lengths,
-                    )
-
-                return logits_step
-
-            while generated < max_new_tokens:
-                logits_step = current_logits[:, -1, :] / temperature
-                logits_step = torch.clamp(logits_step, min=-1e4, max=1e4)
-
-                if top_k is not None:
-                    top_k_logits, _ = torch.topk(logits_step, min(top_k, logits_step.size(-1)))
-                    logits_step = logits_step.masked_fill(logits_step < top_k_logits[:, -1:], float('-inf'))
-
-                if top_p is not None:
-                    logits_step = self._apply_top_p_sampling(logits_step, top_p)
-
-                probs = F.softmax(logits_step, dim=-1)
-                if torch.any(torch.isnan(probs)) or torch.any(torch.isinf(probs)) or torch.any(probs < 0):
-                    logger.warning("Invalid probabilities detected during decoding; using uniform sampling")
-                    probs = torch.ones_like(probs) / probs.size(-1)
-
-                next_token = torch.multinomial(probs, num_samples=1)
-                current_logits = advance(next_token, step_index, forced=False)
+        # Efficiently ingest any overflow tokens before sampling
+        if overflow_tokens.numel() > 0:
+            chunk_size = min(self.config.block_size, overflow_tokens.size(1))
+            for start in range(0, overflow_tokens.size(1), chunk_size):
+                chunk = overflow_tokens[:, start:start + chunk_size]
+                current_logits = _ingest_chunk(chunk)
                 if current_logits is None:
-                    break
+                    return token_ids
 
-                generated += 1
-                step_index += 1
+        if max_new_tokens is None:
+            available = max_context - token_ids.size(1)
+            max_new_tokens = max(0, available)
 
-                if stop_token is not None and (next_token == stop_token).any():
-                    logger.debug(
-                        "Stop token %d generated at step %d, stopping early",
-                        stop_token,
-                        step_index,
+        if max_new_tokens <= 0:
+            return token_ids
+
+        step_index = 0
+        generated = 0
+
+        def advance(next_token: torch.Tensor, step_idx: int, forced: bool) -> Optional[torch.Tensor]:
+            nonlocal past_key_values, token_ids, absolute_pos, use_cache
+            try:
+                with amp_context(self.config, self.device):
+                    position_ids_inner = torch.arange(
+                        absolute_pos,
+                        absolute_pos + next_token.size(1),
+                        device=self.device,
+                    ).unsqueeze(0)
+                    result_inner = self.model(
+                        next_token,
+                        use_cache=use_cache,
+                        position_ids=position_ids_inner,
+                        past_key_values=past_key_values,
+                        return_full_logits=False,
                     )
-                    break
+                    if len(result_inner) == 3:
+                        logits_step, _, past_key_values_inner = result_inner
+                    else:
+                        logits_step, _ = result_inner
+                        past_key_values_inner = None
+                past_key_values = past_key_values_inner
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                logger.warning("OOM detected during generation; cleared cache and skipping this step")
+                return None
+
+            token_ids = torch.cat((token_ids, next_token), dim=1)
+            absolute_pos += next_token.size(1)
+            _trim_context()
+
+            if logger.isEnabledFor(logging.DEBUG):
+                cache_lengths = [kv[0].shape[2] for kv in past_key_values] if past_key_values else []
+                logger.debug(
+                    "Step %d (%s): tokens=%d cache=%s",
+                    step_idx,
+                    "forced" if forced else "sampled",
+                    token_ids.size(1),
+                    cache_lengths,
+                )
+
+            return logits_step
+
+        while generated < max_new_tokens:
+            logits_step = current_logits[:, -1, :] / temperature
+            logits_step = torch.clamp(logits_step, min=-1e4, max=1e4)
+
+            if top_k is not None:
+                top_k_logits, _ = torch.topk(logits_step, min(top_k, logits_step.size(-1)))
+                logits_step = logits_step.masked_fill(logits_step < top_k_logits[:, -1:], float('-inf'))
+
+            if top_p is not None:
+                logits_step = self._apply_top_p_sampling(logits_step, top_p)
+
+            probs = F.softmax(logits_step, dim=-1)
+            if torch.any(torch.isnan(probs)) or torch.any(torch.isinf(probs)) or torch.any(probs < 0):
+                logger.warning("Invalid probabilities detected during decoding; using uniform sampling")
+                probs = torch.ones_like(probs) / probs.size(-1)
+
+            next_token = torch.multinomial(probs, num_samples=1)
+            current_logits = advance(next_token, step_index, forced=False)
+            if current_logits is None:
+                break
+
+            generated += 1
+            step_index += 1
+
+            if stop_token is not None and (next_token == stop_token).any():
+                logger.debug(
+                    "Stop token %d generated at step %d, stopping early",
+                    stop_token,
+                    step_index,
+                )
+                break
 
         # Log memory usage after generation
         try:
@@ -343,7 +347,7 @@ class TextGenerator:
         return token_ids
 
     def generate_batch(self, token_ids_list: List[torch.Tensor],
-                      max_new_tokens: int,
+                      max_new_tokens: Optional[int] = None,
                       temperature: float = 1.0,
                       top_k: Optional[int] = None,
                       top_p: Optional[float] = None,
@@ -353,7 +357,7 @@ class TextGenerator:
 
         Args:
             token_ids_list: List of input token sequences, each of shape (seq_len,)
-            max_new_tokens: Maximum number of new tokens to generate
+            max_new_tokens: Maximum number of new tokens to generate (auto-fills to remaining context if None)
             temperature: Sampling temperature
             top_k: Top-k sampling parameter
             top_p: Top-p sampling parameter

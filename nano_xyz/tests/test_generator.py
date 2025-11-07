@@ -285,3 +285,22 @@ class TestTextGenerator:
         result = generator.generate(prompt, max_new_tokens=0)
 
         assert result.shape[1] == prompt.size(1)
+
+    def test_generate_default_max_tokens_uses_remaining_context(self):
+        """Without explicit max_new_tokens, generator should use remaining context budget."""
+        config = ModelSettings(
+            n_layer=2,
+            n_head=4,
+            n_embd=64,
+            block_size=8,
+            max_cache_len=8,
+            use_yarn=False,
+        )
+        model = ModelArchitecture(config)
+        generator = TextGenerator(model=model)
+
+        prompt = torch.randint(0, config.vocab_size, (1, 4), device=generator.device)
+        torch.manual_seed(0)
+        result = generator.generate(prompt)
+
+        assert result.shape[1] == config.block_size
