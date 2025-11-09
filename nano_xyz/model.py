@@ -7,24 +7,10 @@
 # - SwiGLU: Swish-Gated Linear Unit activation
 # - GQA: Grouped Query Attention (optional)
 # - Top-p sampling: Nucleus sampling for text generation
-#
-# Optimizations integrated:
-# - Fused QKV attention projection (faster, better memory access)
-# - FP32 softmax for numerical stability
-# - Attention logit soft-capping (prevents overflow)
-#
-# Components:
-# - ModelArchitecture: Core transformer model
-# - ModelSettings: Model configuration
-#
-# See also:
-# - training.py: OptimizerFactory, PerformanceMonitor, training helpers
-# - generator.py: TextGenerator for text generation
-# - processor.py: TextProcessor for tokenization
 
 import math
 import logging
-import warnings
+import contextlib
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple, Union, Any
 
@@ -32,6 +18,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
+
+from .attention_utils import build_attention_mask, repeat_kv
 
 # Constants
 DEFAULT_VOCAB_SIZE = 50257  # Default GPT-2 vocab size (auto-detected from tokenizer in practice)
@@ -43,8 +31,6 @@ DEFAULT_DROPOUT = 0.0
 DEFAULT_BIAS = True
 
 WEIGHT_INIT_STD = 0.02
-MIN_TEMPERATURE = 0.1
-MAX_TEMPERATURE = 5.0
 
 logger = logging.getLogger(__name__)
 
@@ -104,13 +90,17 @@ class RotaryPositionEmbedding(nn.Module):
         self.initial_max_seq_len = max_seq_len
         self.base = base
 
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
         self._build_rope_cache()
 
     def _build_rope_cache(self, *, device: Optional[torch.device] = None) -> None:
         """Precompute rotation matrices for all positions and dimensions."""
-        device = device or torch.device('cpu')
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=device).float() / self.dim))
-        t = torch.arange(self.max_seq_len, device=device).float()
+        device = device or self.inv_freq.device
+        inv_freq = self.inv_freq.to(device)
+        self.inv_freq = inv_freq
+        t = torch.arange(self.max_seq_len, device=device, dtype=inv_freq.dtype)
         freqs = torch.einsum('i,j->ij', t, inv_freq)
         cos = freqs.cos()
         sin = freqs.sin()
@@ -119,12 +109,29 @@ class RotaryPositionEmbedding(nn.Module):
 
     def _maybe_extend_rope_cache(self, target_seq_len: int, device: torch.device) -> None:
         if target_seq_len <= self.max_seq_len:
+            if device is not None:
+                if self.cos_cache.device != device:
+                    self.cos_cache = self.cos_cache.to(device)
+                    self.sin_cache = self.sin_cache.to(device)
+                if self.inv_freq.device != device:
+                    self.inv_freq = self.inv_freq.to(device)
             return
         logger.info(
             "Extending RoPE cache from %d to %d positions", self.max_seq_len, target_seq_len
         )
+        old_max = self.max_seq_len
         self.max_seq_len = target_seq_len
-        self._build_rope_cache(device=device)
+        inv_freq = self.inv_freq.to(device)
+        self.inv_freq = inv_freq
+        t = torch.arange(old_max, target_seq_len, device=device, dtype=inv_freq.dtype)
+        freqs = torch.einsum('i,j->ij', t, inv_freq)
+        cos_append = freqs.cos()
+        sin_append = freqs.sin()
+        if self.cos_cache.device != device:
+            self.cos_cache = self.cos_cache.to(device)
+            self.sin_cache = self.sin_cache.to(device)
+        self.cos_cache = torch.cat([self.cos_cache, cos_append], dim=0)
+        self.sin_cache = torch.cat([self.sin_cache, sin_append], dim=0)
 
     def forward(self, x: torch.Tensor, seq_start: int = 0) -> torch.Tensor:
         """Apply rotary position embedding to input tensor.
@@ -186,11 +193,30 @@ class RotaryPositionEmbedding(nn.Module):
         output[..., ::2] = result_complex.real
         output[..., 1::2] = result_complex.imag
 
+        if not torch.isfinite(output).all():
+            logger.warning("Detected non-finite values in RoPE output; clamping to [-1e4, 1e4].")
+            output = torch.clamp(output, min=-1e4, max=1e4)
+
         # Restore original shape if we added a dimension
         if len(original_shape) == 3:
             output = output.squeeze(1)  # Remove head dimension: (B, 1, T, D) -> (B, T, D)
 
         return output
+
+
+def dynamic_rope_update(func):
+    """Decorator that auto-extends RoPE caches when sequences exceed current limits."""
+
+    def wrapper(self, x: torch.Tensor, *args, **kwargs):
+        start = kwargs.get("start", 0)
+        seq_len = x.shape[-2]
+        end_pos = start + seq_len
+        current_limit = getattr(self, "target_ctx", getattr(self, "max_seq_len", end_pos))
+        if end_pos > current_limit and hasattr(self, "resize_cache"):
+            self.resize_cache(end_pos)
+        return func(self, x, *args, **kwargs)
+
+    return wrapper
 
 
 class RopeWithYaRN:
@@ -333,6 +359,7 @@ class RopeWithYaRN:
 
         return y
 
+    @dynamic_rope_update
     def apply_rope(self, x: torch.Tensor, start: int = 0) -> torch.Tensor:
         """Apply RoPE rotation, using fallback if YaRN is not enabled."""
         if not self.enabled and self.rope_fallback is not None:
@@ -342,6 +369,52 @@ class RopeWithYaRN:
             seq_len = x.shape[-2]  # seq_len is second-to-last dim
             freqs = self._frequencies(seq_len, start)
             return RopeWithYaRN.apply(x, freqs)
+
+
+def _build_default_rope(config: "ModelSettings") -> RopeWithYaRN:
+    """Builder for standard rotary embeddings."""
+    head_dim = config.n_embd // config.n_head
+    return RopeWithYaRN(
+        dim=head_dim,
+        base=config.rope_base,
+        orig_ctx=config.block_size,
+        target_ctx=config.block_size,
+        alpha=1.0,
+        beta=1.0,
+        enabled=False,
+    )
+
+
+def _build_yarn_rope(config: "ModelSettings") -> RopeWithYaRN:
+    """Builder for YaRN-scaled rotary embeddings."""
+    head_dim = config.n_embd // config.n_head
+    return RopeWithYaRN(
+        dim=head_dim,
+        base=config.rope_base,
+        orig_ctx=config.yarn_orig_ctx,
+        target_ctx=config.yarn_target_ctx,
+        alpha=config.yarn_alpha,
+        beta=config.yarn_beta,
+        enabled=True,
+    )
+
+
+ROPE_BUILDERS = {
+    "default": _build_default_rope,
+    "yarn": _build_yarn_rope,
+}
+
+
+def build_rope(config: "ModelSettings") -> RopeWithYaRN:
+    """Return the rope module requested by configuration."""
+    rope_key = (config.rope_type or "auto").lower()
+    if rope_key == "auto":
+        rope_key = "yarn" if config.use_yarn else "default"
+
+    builder = ROPE_BUILDERS.get(rope_key)
+    if builder is None:
+        raise ValueError(f"Unknown rope_type '{config.rope_type}'. Available: {', '.join(ROPE_BUILDERS)}")
+    return builder(config)
 
 
 class LCRBlock(nn.Module):
@@ -415,12 +488,10 @@ class GTRBlock(nn.Module):
         self.v_proj2 = nn.Linear(d_model, d_model, bias=bias)
         self.out_proj2 = nn.Linear(d_model, d_model, bias=bias)
 
-        # Tiny MLP for globals
-        self.g_mlp = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model * 2, bias=bias),
-            nn.SiLU(),
-            nn.Linear(4 * d_model * 2, d_model, bias=bias),
-        )
+        # Tiny MLP for globals (SwiGLU: gate * SiLU(up) -> down)
+        self.g_gate = nn.Linear(d_model, 4 * d_model, bias=bias)
+        self.g_up   = nn.Linear(d_model, 4 * d_model, bias=bias)
+        self.g_down = nn.Linear(4 * d_model, d_model, bias=bias)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -451,8 +522,13 @@ class GTRBlock(nn.Module):
         g_upd = self.out_proj1(g_upd)
         g = g + self.dropout(g_upd)
 
-        # MLP on globals
-        g = g + self.dropout(self.g_mlp(self.norm_gmlp(g)))
+        # MLP on globals (SwiGLU)
+        h = self.norm_gmlp(g)
+        u = self.g_up(h)
+        v = self.g_gate(h)
+        h = F.silu(u) * v
+        h = self.g_down(h)
+        g = g + self.dropout(h)
 
         # 2) Sequence <- Globals (Q=seq, K/V=g)
         s2 = self.norm_seq2(x)  # [B, T, C]
@@ -565,18 +641,24 @@ class FocusedAttentionMechanism(nn.Module):
         self.residual_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
 
+        # Keep a hard cap for KV cache length to bound memory/compute during generation
+        self.max_cache_len = config.max_cache_len if config.max_cache_len > 0 else config.block_size
+
         context_limit = config.yarn_target_ctx if config.use_yarn else config.block_size
         context_limit = max(context_limit, config.max_cache_len if config.max_cache_len > 0 else config.block_size)
 
-        self.flash_available = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if config.sliding_window is not None:
+        # Determine SDPA/Flash path availability and log accurate reason when disabled
+        sdpa_available = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        self.flash_available = sdpa_available
+        if config.attn_logit_softcapping is not None:
+            # Softcapping is incompatible with SDPA path in our implementation
             self.flash_available = False
-            logger.info("Sliding window attention enabled - using manual attention implementation")
-        elif config.attn_logit_softcapping is not None:
-            self.flash_available = False
-            logger.info("Attention logit softcapping enabled - using manual attention implementation")
+            logger.info("Manual attention selected: attn_logit_softcapping is enabled.")
         if not self.flash_available:
-            logger.warning("Using manual attention implementation. Flash Attention requires PyTorch >= 2.0")
+            if not sdpa_available:
+                logger.info("Manual attention selected: scaled_dot_product_attention not available in this PyTorch.")
+            else:
+                logger.info("Manual attention selected: feature settings require non-SDPA path.")
             self.register_buffer(
                 "causal_mask",
                 torch.tril(torch.ones(context_limit, context_limit))
@@ -585,64 +667,6 @@ class FocusedAttentionMechanism(nn.Module):
 
         self.rope = RotaryPositionEmbedding(self.head_size, context_limit, base=config.rope_base)
 
-        # Initialize attention sinks first (needed for mask creation)
-        self.use_attention_sinks = config.use_attention_sinks
-        self.attention_sink_size = config.attention_sink_size
-        if self.use_attention_sinks:
-            self._create_attention_sinks()
-
-        self.sliding_window = config.sliding_window
-        if self.sliding_window is not None:
-            self._create_sliding_window_mask(context_limit)
-
-    def _create_sliding_window_mask(self, seq_len: int) -> None:
-        """Create attention mask for sliding window attention.
-
-        Uses absolute distance calculation for robustness and clarity.
-        Attention sinks (if enabled) are always accessible regardless of window size.
-
-        Args:
-            seq_len: Maximum sequence length for the mask
-        """
-        # Create distance matrix: absolute distance between positions
-        row = torch.arange(seq_len).unsqueeze(0)  # query positions
-        col = torch.arange(seq_len).unsqueeze(1)  # key positions
-        distances = torch.abs(row - col)
-
-        # Window mask: attend within sliding window distance
-        window_mask = distances <= self.sliding_window
-
-        # Causal mask: only attend to previous positions (row >= col)
-        causal_mask = row >= col
-
-        # Combine: positions must be both causal AND within window
-        combined_mask = window_mask & causal_mask
-
-        # If attention sinks are enabled, always allow access to sink positions
-        if self.use_attention_sinks and self.attention_sink_size > 0:
-            sink_mask = torch.zeros_like(combined_mask, dtype=torch.bool)
-            sink_mask[:, :self.attention_sink_size] = True
-            combined_mask = combined_mask | sink_mask
-
-        # Convert to additive mask: 0 for allowed, -inf for masked
-        mask = torch.zeros(seq_len, seq_len, dtype=torch.float32)
-        mask.masked_fill_(~combined_mask, float('-inf'))
-
-        self.register_buffer("sliding_window_mask", mask)
-
-    def _create_attention_sinks(self) -> None:
-        """Create fixed attention sink tokens for long context handling.
-
-        Attention sinks are fixed KV states prepended to the cache to maintain
-        attention to important early context tokens.
-        """
-        # Create fixed sink KV states (initialized to small random values)
-        n_embd = self.n_embd
-        sink_k = torch.randn(1, self.n_kv_heads, self.attention_sink_size, self.head_size) * 0.01
-        sink_v = torch.randn(1, self.n_kv_heads, self.attention_sink_size, self.head_size) * 0.01
-
-        self.register_buffer("attention_sink_k", sink_k)
-        self.register_buffer("attention_sink_v", sink_v)
 
     def _concat_past_kv(
         self,
@@ -685,28 +709,6 @@ class FocusedAttentionMechanism(nn.Module):
 
         return q, k_rot
 
-    def _align_kv_heads(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *,
-        is_self_attention: bool,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        target_heads = self.n_head if is_self_attention else q.shape[1]
-        if k.shape[1] == target_heads:
-            return k, v
-
-        if target_heads % k.shape[1] != 0:
-            raise ValueError(
-                f"Cannot align KV heads: target {target_heads}, current {k.shape[1]}"
-            )
-
-        repeat_factor = target_heads // k.shape[1]
-        k = k.repeat_interleave(repeat_factor, dim=1)
-        v = v.repeat_interleave(repeat_factor, dim=1)
-        return k, v
-
     def forward(
         self,
         x: torch.Tensor | None = None,
@@ -720,8 +722,9 @@ class FocusedAttentionMechanism(nn.Module):
         value: torch.Tensor | None = None,
         rope: RopeWithYaRN | None = None,
         freqs: torch.Tensor | None = None,
-        apply_rope: bool = True
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        apply_rope: bool = True,
+        output_attentions: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]], Optional[torch.Tensor]]:
         """Apply multi-head attention to input tensor with optional GQA and KV caching.
 
         Args:
@@ -812,67 +815,59 @@ class FocusedAttentionMechanism(nn.Module):
         k, v, concatenated_cache_len = self._concat_past_kv(k, v, concat_source)
         if concat_source is not None:
             cache_len = concatenated_cache_len
+
+        # Enforce KV cache length limit by trimming oldest tokens (sliding window)
         T_kv = k.shape[2]
-
-        # Apply sliding window to KV cache if enabled
-        if self.sliding_window is not None and T_kv > self.sliding_window:
-            k = k[..., -self.sliding_window:, :]
-            v = v[..., -self.sliding_window:, :]
-            T_kv = self.sliding_window
-
-        # Prepend attention sinks to create windowed attention sinks
-        if self.use_attention_sinks:
-            # Expand sink tokens to match batch size
-            batch_size = k.shape[0]
-            sink_k_expanded = self.attention_sink_k.expand(batch_size, -1, -1, -1)
-            sink_v_expanded = self.attention_sink_v.expand(batch_size, -1, -1, -1)
-
-            k = torch.cat([sink_k_expanded, k], dim=2)
-            v = torch.cat([sink_v_expanded, v], dim=2)
+        if T_kv > self.max_cache_len:
+            k = k[:, :, -self.max_cache_len :, :]
+            v = v[:, :, -self.max_cache_len :, :]
+            # Adjust cache_len to reflect trimmed historical tokens
+            cache_len = max(0, min(cache_len, self.max_cache_len - T_q))
+            # Update T_kv to reflect trimming
             T_kv = k.shape[2]
 
         is_self_attention = x is not None
-        k, v = self._align_kv_heads(q, k, v, is_self_attention=is_self_attention)
+        target_heads = self.n_head if is_self_attention else q.shape[1]
+        if k.shape[1] != target_heads:
+            if target_heads % k.shape[1] != 0:
+                raise ValueError(
+                    f"Cannot align KV heads: target {target_heads}, current {k.shape[1]}"
+                )
+            repeats = target_heads // k.shape[1]
+            k = repeat_kv(k, repeats)
+            v = repeat_kv(v, repeats)
 
         if q.shape[1] != k.shape[1] or v.shape[1] != k.shape[1]:
             raise ValueError(
                 f"Head alignment failure: q={q.shape[1]}, k={k.shape[1]}, v={v.shape[1]}"
             )
 
-        # Prepare attention mask for padding tokens
-        attn_mask_padding = None
-        if attention_mask is not None:
-            if x is not None:  # Self-attention with potential cache
-                # attention_mask shape: (B, T_original) -> need to handle with KV cache
-                if past_key_value is not None:
-                    # For cached sequences, create mask: all 1s for cached tokens, attention_mask for new tokens
-                    # att shape will be (B, H, T_q, T_kv) where T_kv includes cached tokens
-                    # We need to mask out padding in the key dimension (last T_kv)
-                    batch_size = attention_mask.shape[0]
-                    full_mask = torch.ones(batch_size, T_kv, dtype=attention_mask.dtype, device=attention_mask.device)
-                    # Set new token positions from attention_mask
-                    full_mask[:, cache_len:] = attention_mask
-                    attn_mask_padding = (1.0 - full_mask.float()) * float('-inf')
-                    attn_mask_padding = attn_mask_padding.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T_kv)
-                else:
-                    # No cache: use attention_mask directly
-                    # Convert to additive mask: 0 for keep, -inf for mask
-                    attn_mask_padding = (1.0 - attention_mask.float()) * float('-inf')
-                    attn_mask_padding = attn_mask_padding.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T_kv)
-            else:  # Cross-attention
-                # For cross-attention, attention_mask should be (B, T_q, T_kv) or handle appropriately
-                # For now, assume it's already in the right format or None
-                attn_mask_padding = attention_mask
+        cache_tokens_for_mask = 0
+        if is_self_attention and (past_key_value is not None or concat_source is not None):
+            # After trimming, cached tokens are those preceding current queries
+            cache_tokens_for_mask = max(T_kv - original_seq_len, 0)
 
-        if self.flash_available and q.device.type == 'cuda':
+        if is_self_attention:
+            attn_mask_padding = build_attention_mask(
+                batch_size=q.shape[0],
+                total_kv_len=T_kv,
+                attention_mask=attention_mask,
+                cache_len=cache_tokens_for_mask,
+                device=q.device,
+            )
+        else:
+            attn_mask_padding = attention_mask
+
+        attn_weights: Optional[torch.Tensor] = None
+
+        if self.flash_available and q.device.type == 'cuda' and not output_attentions:
             # Use Flash Attention for 20-30% speedup on RTX 30 series
             # Convert attention_mask to additive mask for flash attention
             # Flash attention expects additive mask: 0 for keep, -inf for mask
             flash_attn_mask = attn_mask_padding
 
-            # Use causal masking only for self-attention and when not using sliding window
-            # Sliding window masks are handled via attn_mask, not is_causal
-            is_causal = (x is not None) and (self.sliding_window is None)
+            # Use causal masking only for self-attention; additive masks handle padding
+            is_causal = x is not None
 
             y = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v,
@@ -907,19 +902,13 @@ class FocusedAttentionMechanism(nn.Module):
             if attn_mask_padding is not None:
                 att = att + attn_mask_padding
 
-            # Apply causal/sliding window masks only for self-attention
-            if x is not None:  # Self-attention
-                if self.sliding_window is not None and hasattr(self, 'sliding_window_mask'):
-                    # Fix: Proper broadcasting for sliding window mask
-                    # att shape: (B, H, T_q, T_kv), mask shape: (T_max, T_max)
-                    att = att + self.sliding_window_mask[:T_q, :T_kv].unsqueeze(0).unsqueeze(0)
-                else:
-                    # Apply causal mask for self-attention
-                    if hasattr(self, "causal_mask"):
-                        att = att.masked_fill(
-                            self.causal_mask[:, :, :T_q, :T_kv] == 0,
-                            float('-inf')
-                        )
+            # Apply causal mask for self-attention
+            if x is not None:
+                if hasattr(self, "causal_mask"):
+                    att = att.masked_fill(
+                        self.causal_mask[:, :, :T_q, :T_kv] == 0,
+                        float('-inf')
+                    )
 
             # Numerical stability: Check for NaN/Inf in attention logits
             if torch.isnan(att).any() or torch.isinf(att).any():
@@ -932,6 +921,8 @@ class FocusedAttentionMechanism(nn.Module):
                 att = F.softmax(att, dim=-1)
             
             att = self.attention_dropout(att)
+            if output_attentions:
+                attn_weights = att.detach()
             y = att @ v
 
         y = y.transpose(1, 2).contiguous()
@@ -952,13 +943,20 @@ class FocusedAttentionMechanism(nn.Module):
         # Return cached key/value states if requested (self-attention only)
         past_key_value_out = None
         if use_cache and x is not None:
-            # Return the new k, v (after RoPE, before GQA repetition) for caching
-            # k_new_rope already has RoPE applied and is the new tokens only
-            # v is the new tokens only (no RoPE needed for values)
-            # Both are in shape (B, n_kv_heads, new_seq_len, head_dim)
-            past_key_value_out = (new_k_tokens, new_v_tokens)
+            # Return cumulative (trimmed) K/V for efficient caching across steps
+            # in shape (B, n_kv_heads, seq_len, head_dim)
+            past_key_value_out = (k.detach(), v.detach())
         
-        return y, past_key_value_out
+        if output_attentions and attn_weights is not None:
+            elems = attn_weights.shape[-1] * attn_weights.shape[-2]
+            if elems > 1_000_000:
+                logger.warning(
+                    "Collecting attention tensors for shape %dx%d may consume significant memory.",
+                    attn_weights.shape[-2],
+                    attn_weights.shape[-1],
+                )
+
+        return y, past_key_value_out, attn_weights
 
 
 class FeedForwardNetwork(nn.Module):
@@ -1019,8 +1017,9 @@ class TransformerLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         rope: RopeWithYaRN | None = None,
-        freqs: torch.Tensor | None = None
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        freqs: torch.Tensor | None = None,
+        output_attentions: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]], Optional[torch.Tensor]]:
         """Apply transformer layer to input tensor with optional KV caching.
 
         Args:
@@ -1036,7 +1035,7 @@ class TransformerLayer(nn.Module):
         Returns:
             Tuple of (output, past_key_value)
         """
-        attn_output, past_key_value = self.attention(
+        attn_output, past_key_value, attn_probs = self.attention(
             self.pre_attention_norm(x),
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -1044,11 +1043,12 @@ class TransformerLayer(nn.Module):
             use_cache=use_cache,
             rope=rope,
             freqs=freqs,
-            apply_rope=True  # Always apply RoPE for transformer layers
+            apply_rope=True,  # Always apply RoPE for transformer layers
+            output_attentions=output_attentions,
         )
         x = x + attn_output
         x = x + self.feed_forward(self.pre_mlp_norm(x))
-        return x, past_key_value
+        return x, past_key_value, attn_probs
 
 
 @dataclass
@@ -1064,7 +1064,6 @@ class ModelSettings:
         dropout: Dropout probability for regularization
         bias: Whether to use bias in linear layers
         n_kv_groups: Number of KV groups for GQA (None = standard MHA)
-        sliding_window: Window size for sliding window attention (None = disabled)
         dtype: Data type for mixed precision ('float16', 'bfloat16', 'float32', or None for auto-detect)
         use_fused_attention: Whether to use fused QKV projection (Gemma-2 style, faster)
         attn_logit_softcapping: Optional soft-capping value for attention logits (Gemma-2 feature, prevents overflow)
@@ -1084,8 +1083,9 @@ class ModelSettings:
         lcr_expand: int = 2           # channel expand factor for pointwise conv
         gtr_num_tokens: int = 8       # number of global tokens
         # gtr_num_heads deprecated - now uses n_head
-        # KV cache management
-        max_cache_len: int = 1024     # Maximum KV cache length to prevent unlimited memory growth
+    # KV cache management
+    max_cache_len: int = 1024     # Maximum KV cache length to prevent unlimited memory growth
+    allow_hybrid_cache: bool = False  # Set True to force cache usage even when LCR/GTR blocks exist
     """
     config_version: int = 3  # Increment when config serialization changes
     block_size: int = DEFAULT_BLOCK_SIZE
@@ -1096,10 +1096,9 @@ class ModelSettings:
     dropout: float = DEFAULT_DROPOUT
     bias: bool = DEFAULT_BIAS
     n_kv_groups: Optional[int] = None
-    sliding_window: Optional[int] = None
     dtype: Optional[str] = None  # 'float16', 'bfloat16', 'float32', or None for auto-detect
     use_fused_attention: bool = True  # Gemma-2 style fused QKV projection
-    attn_logit_softcapping: Optional[float] = 30.0  # Gemma-2 feature: tanh-based soft-capping (default 30.0)
+    attn_logit_softcapping: Optional[float] = None  # Gemma-2 feature: set None to prefer SDPA; set >0 to enable soft-capping
     use_fp32_softmax: bool = True  # Upcast softmax to FP32 for numerical stability
     # --- New/extended config fields ---
     # YaRN / RoPE scaling
@@ -1109,20 +1108,21 @@ class ModelSettings:
     yarn_alpha: float = 1.0       # frequency exponent scaling
     yarn_beta: float = 1.0        # magnitude adjustment; keep 1.0 to start
     rope_base: float = 10000.0    # keep your existing base (or whatever you currently use)
+    rope_type: str = "auto"
+    long_context_mode: str = "yarn"
     # Reasoning layers
     use_lcr: bool = True
     use_gtr: bool = True
     lcr_kernel_size: int = 7      # odd >=3
     lcr_expand: int = 2           # channel expand factor for pointwise conv
     gtr_num_tokens: int = 8       # number of global tokens
+    lcr_block_indices: Optional[List[int]] = None
+    gtr_block_indices: Optional[List[int]] = None
     # gtr_num_heads removed - deprecated
-        # KV cache management
+    # KV cache management
     max_cache_len: int = 0        # Auto-set to block_size unless overridden
+    allow_hybrid_cache: bool = False  # Force cache usage even with hybrid layers (experimental)
     use_activation_checkpointing: bool = False  # Enable torch.utils.checkpoint during training
-    max_cache_len: int = 0        # Auto-set to block_size unless overridden
-    use_activation_checkpointing: bool = False
-    use_attention_sinks: bool = False  # Use attention sinks for long context (experimental)
-    attention_sink_size: int = 4       # Number of sink tokens to prepend to KV cache
 
     def __post_init__(self) -> None:
         """Validate configuration parameters."""
@@ -1158,6 +1158,22 @@ class ModelSettings:
                 self.dtype = 'float16'  # Works on older GPUs
         elif self.dtype is None:
             self.dtype = 'float32'  # CPU default
+        valid_rope_types = {"auto", *ROPE_BUILDERS.keys()}
+        self.rope_type = (self.rope_type or "auto").lower()
+        if self.rope_type not in valid_rope_types:
+            raise ValueError(f"rope_type must be one of {sorted(valid_rope_types)}, got {self.rope_type}")
+        if self.rope_type == "auto":
+            self.rope_type = "yarn" if self.use_yarn else "default"
+        valid_long_modes = {"none", "yarn"}
+        self.long_context_mode = (self.long_context_mode or "yarn").lower()
+        if self.long_context_mode not in valid_long_modes:
+            raise ValueError(f"long_context_mode must be one of {sorted(valid_long_modes)}, got {self.long_context_mode}")
+        if self.long_context_mode == "yarn":
+            if not self.use_yarn:
+                logger.info("long_context_mode='yarn' enabling YaRN scaling.")
+            self.use_yarn = True
+        else:
+            self.use_yarn = False
         if self.n_kv_groups is None:
             self.n_kv_groups = self.n_head
         if self.n_kv_groups is not None:
@@ -1170,13 +1186,6 @@ class ModelSettings:
             if self.n_head % self.n_kv_groups != 0:
                 raise ValueError(
                     f"n_head ({self.n_head}) must be divisible by n_kv_groups ({self.n_kv_groups})"
-                )
-        if self.sliding_window is not None:
-            if self.sliding_window <= 0:
-                raise ValueError(f"sliding_window must be positive, got {self.sliding_window}")
-            if self.sliding_window > self.block_size:
-                raise ValueError(
-                    f"sliding_window ({self.sliding_window}) cannot exceed block_size ({self.block_size})"
                 )
         if self.attn_logit_softcapping is not None:
             if self.attn_logit_softcapping <= 0:
@@ -1201,17 +1210,41 @@ class ModelSettings:
             raise ValueError(f"lcr_expand must be positive, got {self.lcr_expand}")
         if self.gtr_num_tokens <= 0:
             raise ValueError(f"gtr_num_tokens must be positive, got {self.gtr_num_tokens}")
+        def _normalize_positions(name: str, values: Optional[List[int]]) -> List[int]:
+            if not values:
+                return []
+            unique = sorted(set(values))
+            for idx in unique:
+                if idx < 0 or idx >= self.n_layer:
+                    raise ValueError(f"{name} index {idx} is outside valid layer range [0, {self.n_layer - 1}]")
+            return unique
+        if self.use_lcr:
+            self.lcr_block_indices = _normalize_positions("lcr_block_indices", self.lcr_block_indices)
+            if not self.lcr_block_indices:
+                self.lcr_block_indices = [max(1, self.n_layer // 2)]
+        else:
+            self.lcr_block_indices = []
+        if self.use_gtr:
+            self.gtr_block_indices = _normalize_positions("gtr_block_indices", self.gtr_block_indices)
+            if not self.gtr_block_indices:
+                self.gtr_block_indices = [max(self.n_layer - 3, 0)]
+        else:
+            self.gtr_block_indices = []
         # gtr_num_heads validation removed - deprecated parameter
         # Validate KV cache parameters
         if self.max_cache_len <= 0:
             self.max_cache_len = self.block_size
-        # Validate attention sink parameters
-        if self.attention_sink_size <= 0:
-            raise ValueError(f"attention_sink_size must be positive, got {self.attention_sink_size}")
-        if self.use_attention_sinks and self.attention_sink_size >= self.max_cache_len:
+
+        # Allow max_cache_len > block_size when using YaRN with extended context
+        effective_context_limit = self.block_size
+        if self.use_yarn and self.yarn_target_ctx > self.block_size:
+            effective_context_limit = self.yarn_target_ctx
+
+        if self.max_cache_len > effective_context_limit:
             raise ValueError(
-                f"attention_sink_size ({self.attention_sink_size}) must be less than max_cache_len ({self.max_cache_len})"
+                f"max_cache_len ({self.max_cache_len}) cannot exceed effective context limit ({effective_context_limit})"
             )
+        # Validate attention sink parameters
         self.use_activation_checkpointing = bool(self.use_activation_checkpointing)
 
 
@@ -1226,59 +1259,46 @@ class ModelArchitecture(nn.Module):
         """
         super().__init__()
         self.config = config
+        self.gradient_checkpointing = bool(config.use_activation_checkpointing)
 
         # Global numerical stability: disable reduced precision reductions to prevent overflow
         if torch.cuda.is_available():
             torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
             torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 
-        # Initialize YaRN RoPE helper
-        head_dim = config.n_embd // config.n_head
-        self.rope = RopeWithYaRN(
-            dim=head_dim,
-            base=config.rope_base,
-            orig_ctx=config.yarn_orig_ctx,
-            target_ctx=(config.yarn_target_ctx if config.use_yarn else config.yarn_orig_ctx),
-            alpha=config.yarn_alpha,
-            beta=config.yarn_beta,
-            enabled=config.use_yarn,
-            device=None,   # set at forward
-            dtype=None
-        )
+        # Initialize RoPE helper from registry
+        self.rope = build_rope(config)
+        logger.info("Initialized RoPE type: %s", config.rope_type)
 
         depth = config.n_layer
 
-        # Place LCR near the lower-middle if depth allows; else skip gracefully
-        lcr_i = 4 if (config.use_lcr and depth >= 6) else None
-
-        # Place GTR near the upper stack. Prefer index 9 when depth >= 12; otherwise ~depth-3 if possible
-        if config.use_gtr:
-            if depth >= 12:
-                gtr_i = 9
-            elif depth >= 6:
-                gtr_i = depth - 3
-            else:
-                gtr_i = None
-        else:
-            gtr_i = None
-
-        # Ensure LCR and GTR don't overlap - shift GTR if needed
-        if lcr_i is not None and gtr_i is not None and lcr_i == gtr_i:
-            gtr_i += 1  # Shift GTR to next layer
-            if gtr_i >= depth:
-                gtr_i = depth - 1  # Clamp to last layer
+        lcr_positions = set(config.lcr_block_indices if config.use_lcr else [])
+        gtr_positions = set(config.gtr_block_indices if config.use_gtr else [])
+        overlap = lcr_positions & gtr_positions
+        if overlap:
+            raise ValueError(f"LCR and GTR blocks cannot share the same indices: {sorted(overlap)}")
 
         layers: List[nn.Module] = []
         for i in range(depth):
-            if lcr_i is not None and i == lcr_i:
-                layers.append(LCRBlock(config.n_embd, kernel_size=config.lcr_kernel_size,
-                                      expand=config.lcr_expand, dropout=config.dropout,
-                                      bias=config.bias))
-            elif gtr_i is not None and i == gtr_i:
-                layers.append(GTRBlock(config.n_embd,
-                                      num_tokens=config.gtr_num_tokens,
-                                      dropout=config.dropout,
-                                      bias=config.bias))
+            if i in lcr_positions:
+                layers.append(
+                    LCRBlock(
+                        config.n_embd,
+                        kernel_size=config.lcr_kernel_size,
+                        expand=config.lcr_expand,
+                        dropout=config.dropout,
+                        bias=config.bias,
+                    )
+                )
+            elif i in gtr_positions:
+                layers.append(
+                    GTRBlock(
+                        config.n_embd,
+                        num_tokens=config.gtr_num_tokens,
+                        dropout=config.dropout,
+                        bias=config.bias,
+                    )
+                )
             else:
                 layers.append(TransformerLayer(config))
 
@@ -1290,11 +1310,11 @@ class ModelArchitecture(nn.Module):
         ))
 
         logger.info(
-            "Depth=%d; LCR index=%s; GTR index=%s; YaRN target ctx=%d",
+            "Depth=%d; LCR positions=%s; GTR positions=%s; long_context_mode=%s",
             depth,
-            lcr_i if lcr_i is not None else "disabled",
-            gtr_i if gtr_i is not None else "disabled",
-            config.yarn_target_ctx if config.use_yarn else config.yarn_orig_ctx,
+            config.lcr_block_indices if config.use_lcr else "disabled",
+            config.gtr_block_indices if config.use_gtr else "disabled",
+            config.long_context_mode,
         )
 
         self.language_model_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -1314,23 +1334,26 @@ class ModelArchitecture(nn.Module):
                     f"n_embd={config.n_embd}, vocab_size={config.vocab_size}, block_size={config.block_size}")
 
     def enable_lora(self, r: int = 8, lora_alpha: int = 16, lora_dropout: float = 0.05,
-                   target_modules: Optional[List[str]] = None) -> None:
-        """Enable LoRA (Low-Rank Adaptation) for efficient fine-tuning.
+                   target_modules: Optional[List[str]] = None):
+        """Enable LoRA (Low-Rank Adaptation) and return a PEFT-wrapped model.
 
         Args:
             r: LoRA rank
             lora_alpha: LoRA scaling factor
             lora_dropout: LoRA dropout rate
-            target_modules: List of module names to apply LoRA to. If None, applies to attention layers.
+            target_modules: Module names to apply LoRA to. If None, inferred from the model.
+
+        Returns:
+            A PEFT-wrapped model (PeftModel) ready for training.
         """
         try:
-            from peft import LoraConfig, get_peft_model
+            from peft import LoraConfig, get_peft_model  # type: ignore
         except ImportError:
             raise ImportError("PEFT library required for LoRA. Install with: pip install peft")
 
         if target_modules is None:
-            # Default to attention modules (compatible with the model's structure)
-            target_modules = ["qkv_projection", "output_projection"]
+            # Infer sensible defaults based on available projection names
+            target_modules = self._infer_lora_target_modules()
 
         lora_config = LoraConfig(
             r=r,
@@ -1341,14 +1364,34 @@ class ModelArchitecture(nn.Module):
             task_type="CAUSAL_LM",
         )
 
-        # Wrap model with LoRA
-        self.lora_config = lora_config
-        self.lora_enabled = True
+        logger.info(
+            "Enabling LoRA with r=%s, alpha=%s, dropout=%s on modules=%s",
+            r, lora_alpha, lora_dropout, target_modules,
+        )
 
-        # Note: get_peft_model returns a new model, so we need to replace self
-        # This is a bit tricky with the current class structure
-        logger.info(f"LoRA enabled with r={r}, alpha={lora_alpha}, target_modules={target_modules}")
-        logger.warning("LoRA wrapping requires model recreation. Call get_peft_model(model, lora_config) externally")
+        wrapped = get_peft_model(self, lora_config)
+        # Expose for downstream tooling
+        setattr(wrapped, "lora_config", lora_config)
+        setattr(wrapped, "lora_enabled", True)
+        return wrapped
+
+    def _infer_lora_target_modules(self) -> List[str]:
+        """Detect likely attention projection modules for LoRA.
+
+        Returns a list including fused and/or separate QKV projections plus output projection
+        depending on what exists in the current model.
+        """
+        candidates = {"qkv_projection", "query_projection", "key_projection", "value_projection", "output_projection"}
+        found: set[str] = set()
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                leaf = name.rsplit(".", 1)[-1]
+                if leaf in candidates:
+                    found.add(leaf)
+        if not found:
+            # Fall back to broad default across known names
+            return sorted(candidates)
+        return sorted(found)
 
     @classmethod
     def create_with_lora(cls, config: "ModelSettings", r: int = 8, lora_alpha: int = 16,
@@ -1366,7 +1409,7 @@ class ModelArchitecture(nn.Module):
             LoRA-wrapped model
         """
         try:
-            from peft import LoraConfig, get_peft_model
+            from peft import LoraConfig, get_peft_model  # type: ignore
         except ImportError:
             raise ImportError("PEFT library required for LoRA. Install with: pip install peft")
 
@@ -1374,8 +1417,7 @@ class ModelArchitecture(nn.Module):
         model = cls(config)
 
         if target_modules is None:
-            # Default to attention modules
-            target_modules = ["qkv_projection", "output_projection"]
+            target_modules = model._infer_lora_target_modules()
 
         lora_config = LoraConfig(
             r=r,
@@ -1388,9 +1430,15 @@ class ModelArchitecture(nn.Module):
 
         # Wrap with LoRA
         lora_model = get_peft_model(model, lora_config)
+        setattr(lora_model, "lora_config", lora_config)
+        setattr(lora_model, "lora_enabled", True)
 
-        logger.info(f"Created model with LoRA: r={r}, alpha={lora_alpha}, target_modules={target_modules}")
-        logger.info(f"Trainable parameters: {lora_model.get_nb_trainable_parameters()}")
+        try:
+            trainable = lora_model.get_nb_trainable_parameters()  # type: ignore[attr-defined]
+            logger.info(f"Created model with LoRA: r={r}, alpha={lora_alpha}, target_modules={target_modules}")
+            logger.info(f"Trainable parameters: {trainable}")
+        except Exception:
+            logger.info(f"Created model with LoRA: r={r}, alpha={lora_alpha}, target_modules={target_modules}")
 
         return lora_model
 
@@ -1437,12 +1485,20 @@ class ModelArchitecture(nn.Module):
         token_ids: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        use_amp: Optional[bool] = None,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
         position_ids: Optional[torch.Tensor] = None,
-        return_full_logits: bool = False
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
+        return_full_logits: bool = False,
+        output_hidden_states: bool = False,
+        output_attentions: bool = False,
+        skip_lm_head: bool = False,
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[List[Tuple[torch.Tensor, torch.Tensor]]],
+        Optional[torch.Tensor],
+        Optional[Tuple[Optional[torch.Tensor], ...]],
+    ]:
         """Forward pass through the model with optional KV caching.
 
         Args:
@@ -1450,12 +1506,14 @@ class ModelArchitecture(nn.Module):
             targets: Optional target token IDs for training
             attention_mask: Optional attention mask of shape (batch_size, seq_len) where 1 = real token, 0 = padding.
                            Used to mask padding tokens in attention computation and loss calculation.
-            use_amp: Whether to use automatic mixed precision. If None, auto-detects from dtype
             past_key_values: Optional list of cached key/value states for each layer
             use_cache: Whether to return cached key/value states
             position_ids: Optional position IDs for KV caching
             return_full_logits: When True and targets is None, return logits for all tokens instead of
                 just the last position. Defaults to False for generation use-cases.
+            output_hidden_states: When True, also return the final hidden states before the LM head.
+            skip_lm_head: When True, skip applying the LM head entirely. Requires output_hidden_states=True and
+                is incompatible with providing targets/return_full_logits.
 
         Returns:
             Tuple of (logits, loss, past_key_values) where:
@@ -1468,6 +1526,14 @@ class ModelArchitecture(nn.Module):
         if token_ids.dtype != torch.long:
             raise ValueError(f"token_ids must be long tensor, got {token_ids.dtype}")
 
+        if skip_lm_head:
+            if not output_hidden_states:
+                raise ValueError("skip_lm_head=True requires output_hidden_states=True to return meaningful data.")
+            if targets is not None or return_full_logits:
+                raise ValueError(
+                    "skip_lm_head=True cannot be combined with targets or return_full_logits since logits are skipped."
+                )
+
         device = token_ids.device
         batch_size, seq_len = token_ids.size()
 
@@ -1478,20 +1544,53 @@ class ModelArchitecture(nn.Module):
         if seq_len > self.config.block_size:
             raise ValueError(f"Sequence length {seq_len} exceeds block size {self.config.block_size}")
 
-        # Fix: Clamp token IDs to valid range (defensive programming)
-        token_ids = torch.clamp(token_ids, 0, self.config.vocab_size - 1)
+        # Token ID policy: validate in training, clamp in inference for robustness
+        if self.training:
+            if token_ids.min().item() < 0 or token_ids.max().item() >= self.config.vocab_size:
+                raise ValueError(
+                    f"token_ids out of range [0, {self.config.vocab_size - 1}] during training"
+                )
+        else:
+            token_ids = torch.clamp(token_ids, 0, self.config.vocab_size - 1)
 
         auto_targets = targets is None
+        hybrid_blocks_enabled = bool(self.config.use_lcr or self.config.use_gtr)
+        hybrid_cache_blocked = hybrid_blocks_enabled and not getattr(self.config, "allow_hybrid_cache", False)
+
+        if hybrid_cache_blocked:
+            # Be permissive: ignore provided caches and disable returning new caches
+            if past_key_values:
+                if not getattr(self, "_hybrid_cache_warning_emitted", False):
+                    logger.warning(
+                        "Ignoring provided past_key_values because hybrid LCR/GTR blocks are active and "
+                        "allow_hybrid_cache=False. Full prefix will be recomputed each step."
+                    )
+                past_key_values = None
+            if use_cache and not getattr(self, "_hybrid_cache_warning_emitted", False):
+                logger.warning(
+                    "Disabling use_cache because LCR/GTR blocks require full sequence context. "
+                    "Set allow_hybrid_cache=True to enable transformer-layer KV caching."
+                )
+                self._hybrid_cache_warning_emitted = True
+            if use_cache:
+                use_cache = False
 
         # Forward pass with centralized mixed precision
-        from .utils import amp_context
-        with amp_context(self.config, device):
+        dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16}
+        use_autocast = device.type == "cuda" and self.config.dtype in dtype_map
+        if use_autocast:
+            autocast_ctx = torch.autocast(device_type=device.type, dtype=dtype_map[self.config.dtype], enabled=True)
+        else:
+            autocast_ctx = contextlib.nullcontext()
+
+        with autocast_ctx:
             token_embeds = self.transformer.token_embeddings(token_ids)
             hidden_states = self.transformer.dropout(token_embeds)
 
             freq_device = hidden_states.device
             freq_dtype = hidden_states.dtype if hidden_states.dtype in (torch.float16, torch.bfloat16, torch.float32) else torch.float32
             freq_cache: Dict[int, torch.Tensor] = {}
+            attentions_output: List[Optional[torch.Tensor]] = [] if output_attentions else []
 
             def get_freqs(start: int) -> torch.Tensor:
                 if start not in freq_cache:
@@ -1547,54 +1646,86 @@ class ModelArchitecture(nn.Module):
                         hidden_states = checkpoint(layer_forward, hidden_states)
                         layer_present = None
                     else:
-                        hidden_states, layer_present = layer(
+                        hidden_states, layer_present, layer_attention = layer(
                             hidden_states,
                             attention_mask=attention_mask,
                             position_ids=position_ids,
                             past_key_value=layer_past,
                             use_cache=use_cache,
                             rope=self.rope,
-                            freqs=freqs
+                            freqs=freqs,
+                            output_attentions=output_attentions,
                         )
+                        if output_attentions:
+                            attentions_output.append(layer_attention)
                     kv_index += 1
                 elif isinstance(layer, LCRBlock):
                     # Local Convolutional Reasoning block
-                    hidden_states = layer(hidden_states)
+                    if (
+                        self.config.use_activation_checkpointing
+                        and self.training
+                        and not use_cache
+                    ):
+                        def lcr_forward(hs: torch.Tensor) -> torch.Tensor:
+                            return layer(hs)
+                        hidden_states = checkpoint(lcr_forward, hidden_states)
+                    else:
+                        hidden_states = layer(hidden_states)
                     layer_present = None
+                    if output_attentions:
+                        attentions_output.append(None)
                 elif isinstance(layer, GTRBlock):
                     # Global Token Reasoning block
-                    hidden_states = layer(hidden_states, attn_mask=attention_mask)
+                    if (
+                        self.config.use_activation_checkpointing
+                        and self.training
+                        and not use_cache
+                    ):
+                        def gtr_forward(hs: torch.Tensor) -> torch.Tensor:
+                            return layer(hs, attn_mask=attention_mask)
+                        hidden_states = checkpoint(gtr_forward, hidden_states)
+                    else:
+                        hidden_states = layer(hidden_states, attn_mask=attention_mask)
                     layer_present = None
+                    if output_attentions:
+                        attentions_output.append(None)
                 else:
                     # Fallback for future block types
                     hidden_states = layer(hidden_states)
                     layer_present = None
+                    if output_attentions:
+                        attentions_output.append(None)
 
                 if isinstance(layer, TransformerLayer) and use_cache and layer_present is not None:
                     present_key_values.append(layer_present)
 
             hidden_states = self.transformer.final_norm(hidden_states)
+            hidden_output = hidden_states if output_hidden_states else None
 
-            logits_full = self.language_model_head(hidden_states)
-            if targets is not None or return_full_logits:
-                logits = logits_full
-            else:
-                logits = logits_full[:, [-1], :]
+            logits = None
+            logits_full = None
+            if not skip_lm_head:
+                logits_full = self.language_model_head(hidden_states)
+                if targets is not None or return_full_logits:
+                    logits = logits_full
+                else:
+                    logits = logits_full[:, [-1], :]
 
             loss = None
             targets_for_loss: Optional[torch.Tensor] = None
             logits_for_loss: Optional[torch.Tensor] = None
             mask_for_loss: Optional[torch.Tensor] = None
 
-            if auto_targets and seq_len > 1:
-                logits_for_loss = logits_full[:, :-1, :].contiguous()
-                targets_for_loss = token_ids[:, 1:].contiguous()
-                if attention_mask is not None:
-                    mask_for_loss = attention_mask[:, 1:].contiguous()
-            elif not auto_targets and targets is not None:
-                logits_for_loss = logits_full
-                targets_for_loss = targets
-                mask_for_loss = attention_mask
+            if logits_full is not None:
+                if auto_targets and seq_len > 1:
+                    logits_for_loss = logits_full[:, :-1, :].contiguous()
+                    targets_for_loss = token_ids[:, 1:].contiguous()
+                    if attention_mask is not None:
+                        mask_for_loss = attention_mask[:, 1:].contiguous()
+                elif not auto_targets and targets is not None:
+                    logits_for_loss = logits_full
+                    targets_for_loss = targets
+                    mask_for_loss = attention_mask
 
             if logits_for_loss is not None and targets_for_loss is not None:
                 targets_flat = targets_for_loss.view(-1).clone()
@@ -1607,10 +1738,12 @@ class ModelArchitecture(nn.Module):
                     ignore_index=-1,
                 )
 
-        # Backward compatibility: if not using cache, return old format
-        if not use_cache:
-            return logits, loss
-        return logits, loss, present_key_values
+        attentions_tuple: Optional[Tuple[Optional[torch.Tensor], ...]] = None
+        if output_attentions:
+            attentions_tuple = tuple(attentions_output)
+
+        present = present_key_values if use_cache else None
+        return logits, loss, present, hidden_output if output_hidden_states else None, attentions_tuple
 
     def crop_context_window(self, new_block_size: int) -> None:
         """Reduce the model's maximum context window.
@@ -1656,15 +1789,18 @@ class ModelArchitecture(nn.Module):
                         dtype=None
                     )
 
-            if getattr(attn, 'sliding_window', None) is not None:
-                attn._create_sliding_window_mask(new_block_size)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.transformer.token_embeddings
+
+    def set_input_embeddings(self, new_embeddings: nn.Embedding) -> None:
+        self.transformer.token_embeddings = new_embeddings
+        self.language_model_head.weight = new_embeddings.weight
 
 
 # Exported classes are now in separate modules:
 # - OptimizerFactory, PerformanceMonitor: training.py
-# - TextProcessor: processor.py
 # - TextGenerator: generator.py
 
 # Alias for backward compatibility
 GPTConfig = ModelSettings
-

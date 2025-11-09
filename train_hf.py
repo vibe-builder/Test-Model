@@ -1,0 +1,311 @@
+"""Training entrypoint that relies on Hugging Face Trainer."""
+
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass, field
+from typing import Optional
+
+import datasets
+from datasets import load_dataset
+from transformers import (
+    AutoTokenizer,
+    DataCollatorForLanguageModeling,
+    HfArgumentParser,
+    Trainer,
+    TrainingArguments,
+)
+
+from nano_xyz.configuration_nano import NanoConfig
+from nano_xyz.modeling_nano import NanoForCausalLM
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ModelArguments:
+    """Arguments related to model/config/tokenizer selection."""
+
+    model_name_or_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to pretrained weights. Leave None to train Nano from scratch."},
+    )
+    tokenizer_name: Optional[str] = field(
+        default="gpt2",
+        metadata={"help": "Tokenizer identifier or path."},
+    )
+    config_overrides: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Override NanoConfig fields with key=value pairs separated by commas (e.g. block_size=2048,n_layer=16)."
+        },
+    )
+    preset: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Optional model size preset: 'tiny' (~30M) or 'small' (~110M). Overrides can still adjust fields.",
+        },
+    )
+    # LoRA options
+    lora_enable: bool = field(
+        default=False,
+        metadata={"help": "Enable LoRA parameter-efficient fine-tuning."},
+    )
+    lora_r: int = field(
+        default=8,
+        metadata={"help": "LoRA rank (r)."},
+    )
+    lora_alpha: int = field(
+        default=16,
+        metadata={"help": "LoRA alpha (scaling)."},
+    )
+    lora_dropout: float = field(
+        default=0.05,
+        metadata={"help": "LoRA dropout."},
+    )
+    lora_target_modules: Optional[str] = field(
+        default=None,
+        metadata={"help": "Comma-separated module names to apply LoRA to (e.g., qkv_projection,output_projection). Auto-detected if omitted."},
+    )
+
+
+@dataclass
+class DataTrainingArguments:
+    """Arguments for loading and preprocessing the training corpus."""
+
+    dataset_name: Optional[str] = field(
+        default=None,
+        metadata={"help": "Name of a dataset from the HF hub (e.g., 'wikitext')."},
+    )
+    dataset_config_name: Optional[str] = field(
+        default=None,
+        metadata={"help": "Dataset config name (e.g., 'wikitext-103-v1')."},
+    )
+    train_file: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to a local text file with training data."},
+    )
+    validation_file: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional validation text file."},
+    )
+    preprocessing_num_workers: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of workers for tokenization."},
+    )
+
+
+def parse_config_overrides(overrides: Optional[str]) -> dict:
+    if not overrides:
+        return {}
+    result = {}
+    for entry in overrides.split(","):
+        if not entry:
+            continue
+        key, value = entry.split("=")
+        value = value.strip()
+        if value.isdigit():
+            result[key.strip()] = int(value)
+        else:
+            try:
+                result[key.strip()] = float(value)
+            except ValueError:
+                lowered = value.lower()
+                if lowered in {"true", "false"}:
+                    result[key.strip()] = lowered == "true"
+                else:
+                    result[key.strip()] = value
+    return result
+
+
+def main():
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
+    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    logging.basicConfig(level=logging.INFO if training_args.local_rank <= 0 else logging.WARN)
+
+    # Enable TF32 for better throughput on Ampere+ GPUs (safe for training)
+    try:  # pragma: no cover
+        import torch
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True  # type: ignore[attr-defined]
+            torch.backends.cudnn.allow_tf32 = True  # type: ignore[attr-defined]
+            logger.info("Enabled TF32 matmuls for CUDA backends")
+    except Exception:
+        pass
+
+    tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    if model_args.model_name_or_path:
+        config = NanoConfig.from_pretrained(model_args.model_name_or_path)
+        model = NanoForCausalLM.from_pretrained(model_args.model_name_or_path, config=config)
+    else:
+        # Apply preset defaults, then apply overrides
+        overrides = parse_config_overrides(model_args.config_overrides)
+        preset = (model_args.preset or "").lower().strip()
+        if preset == "tiny":
+            base = dict(
+                block_size=1024,
+                n_layer=6,
+                n_head=8,
+                n_embd=512,
+                attn_logit_softcapping=None,
+                use_fp32_softmax=True,
+                max_cache_len=1024,
+                rope_type="default",
+                use_lcr=False,
+                use_gtr=False,
+            )
+        elif preset == "small":
+            base = dict(
+                block_size=1024,
+                n_layer=12,
+                n_head=12,
+                n_embd=768,
+                attn_logit_softcapping=None,
+                use_fp32_softmax=True,
+                max_cache_len=1024,
+                rope_type="default",
+                use_lcr=False,
+                use_gtr=False,
+            )
+        else:
+            base = {}
+        base.update(overrides)
+        config = NanoConfig(**base)
+        model = NanoForCausalLM(config)
+
+    # Optional: Enable LoRA
+    if model_args.lora_enable:
+        try:
+            from peft import LoraConfig, get_peft_model  # type: ignore
+        except ImportError as e:
+            raise ImportError("PEFT library required for LoRA. Install with: pip install peft") from e
+
+        def infer_lora_targets(model_obj) -> list[str]:
+            candidates = {"qkv_projection", "query_projection", "key_projection", "value_projection", "output_projection"}
+            found: set[str] = set()
+            for name, module in model_obj.named_modules():
+                if isinstance(module, torch.nn.Linear):
+                    leaf = name.rsplit(".", 1)[-1]
+                    if leaf in candidates:
+                        found.add(leaf)
+            return sorted(found) if found else sorted(candidates)
+
+        targets = (
+            [t.strip() for t in model_args.lora_target_modules.split(",") if t.strip()]
+            if model_args.lora_target_modules
+            else infer_lora_targets(model)
+        )
+        logger.info("LoRA target modules: %s", targets)
+
+        lora_cfg = LoraConfig(
+            r=model_args.lora_r,
+            lora_alpha=model_args.lora_alpha,
+            lora_dropout=model_args.lora_dropout,
+            target_modules=targets,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_cfg)
+        # Log trainable params
+        try:
+            if hasattr(model, "print_trainable_parameters"):
+                model.print_trainable_parameters()  # type: ignore
+        except Exception:
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            logger.info("LoRA enabled. Trainable parameters: %s", trainable)
+
+    if data_args.dataset_name:
+        raw_datasets = load_dataset(data_args.dataset_name, data_args.dataset_config_name)
+    else:
+        data_files = {}
+        if data_args.train_file:
+            data_files["train"] = data_args.train_file
+        if data_args.validation_file:
+            data_files["validation"] = data_args.validation_file
+        extension = os.path.splitext(list(data_files.values())[0])[1].lstrip(".")
+        raw_datasets = load_dataset(extension, data_files=data_files)
+
+    column_names = raw_datasets["train"].column_names
+    text_column = "text" if "text" in column_names else column_names[0]
+
+    def tokenize_function(examples):
+        return tokenizer(examples[text_column])
+
+    with training_args.main_process_first(desc="tokenize dataset"):
+        tokenized = raw_datasets.map(
+            tokenize_function,
+            batched=True,
+            num_proc=data_args.preprocessing_num_workers,
+            remove_columns=column_names,
+        )
+
+    block_size = min(tokenizer.model_max_length, config.block_size)
+
+    def group_texts(examples):
+        concatenated = sum(examples["input_ids"], [])
+        total_length = (len(concatenated) // block_size) * block_size
+        result = {
+            "input_ids": [concatenated[i : i + block_size] for i in range(0, total_length, block_size)]
+        }
+        result["labels"] = result["input_ids"].copy()
+        return result
+
+    lm_datasets = tokenized.map(group_texts, batched=True, num_proc=data_args.preprocessing_num_workers)
+
+    train_dataset = lm_datasets["train"]
+    eval_dataset = lm_datasets.get("validation")
+
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+    # Lightweight throughput logging: tokens/sec estimation
+    from transformers import TrainerCallback
+
+    class ThroughputCallback(TrainerCallback):  # pragma: no cover
+        def __init__(self, block_size: int) -> None:
+            self.block_size = block_size
+            self._last_time = None
+            self._last_step = None
+
+        def on_step_end(self, args, state, control, **kwargs):
+            import time
+            now = time.time()
+            if self._last_time is not None and self._last_step is not None:
+                dt = now - self._last_time
+                steps = state.global_step - self._last_step
+                if dt > 0 and steps > 0:
+                    # Approximate tokens/sec = steps * global_batch * block_size / time
+                    gbs = args.per_device_train_batch_size * max(1, args.world_size) * max(1, args.gradient_accumulation_steps)
+                    toks = steps * gbs * self.block_size
+                    logger.info("throughput: %.1f tok/s (approx)", toks / dt)
+            self._last_time = now
+            self._last_step = state.global_step
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        callbacks=[ThroughputCallback(block_size)],
+    )
+
+    train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+    trainer.save_model()
+    trainer.log_metrics("train", train_result.metrics)
+    trainer.save_metrics("train", train_result.metrics)
+    trainer.save_state()
+
+    if eval_dataset is not None:
+        metrics = trainer.evaluate()
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
+
+
+if __name__ == "__main__":
+    main()
