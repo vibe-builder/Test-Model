@@ -1617,7 +1617,14 @@ class ModelArchitecture(nn.Module):
             # Dynamic KV cache extension for long sequences
             if past_key_values and seq_len > 0:
                 # Check if we need to extend RoPE cache beyond block_size
-                max_cache_len = max(layer_past[0].shape[2] for layer_past in past_key_values if layer_past[0] is not None) if past_key_values else 0
+                max_cache_len = 0
+                try:
+                    lengths = [lp[0].shape[2] for lp in past_key_values if lp and lp[0] is not None]
+                    if lengths:
+                        max_cache_len = max(lengths)
+                except Exception:
+                    # Unknown cache type (e.g., DynamicCache); skip global resize and rely on per-layer freqs
+                    max_cache_len = 0
                 if seq_len + max_cache_len > self.config.block_size:
                     # Extend rope freqs dynamically with YaRN extrapolation
                     self.rope.resize_cache(max_seq_len=seq_len + max_cache_len)

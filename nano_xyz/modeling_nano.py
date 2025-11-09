@@ -208,12 +208,30 @@ class NanoForCausalLM(NanoPreTrainedModel, GenerationMixin):
         **kwargs,
     ):
         position_ids = kwargs.pop("position_ids", None)
+
+        # Determine whether caching is supported given hybrid blocks
+        allow_hybrid_cache = getattr(self.config, "allow_hybrid_cache", False)
+        hybrid_enabled = bool(getattr(self.config, "use_lcr", False) or getattr(self.config, "use_gtr", False))
+        supports_cache = not (hybrid_enabled and not allow_hybrid_cache)
+
+        if not supports_cache:
+            # Hybrid layers require full-sequence context; do not slice inputs or carry caches
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "past_key_values": None,
+                **kwargs,
+            }
+
         new_tokens_len = input_ids.size(1)
-        past_length = (
-            past_key_values[0][0].shape[2]
-            if past_key_values and past_key_values[0][0] is not None
-            else 0
-        )
+        past_length = 0
+        try:
+            if past_key_values and past_key_values[0][0] is not None:
+                past_length = past_key_values[0][0].shape[2]
+        except Exception:
+            # Handle DynamicCache or other cache types
+            past_length = 0
+
         if past_key_values:
             input_ids = input_ids[:, -1:]
             if attention_mask is not None and attention_mask.size(1) == new_tokens_len:
