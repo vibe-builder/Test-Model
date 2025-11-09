@@ -247,13 +247,27 @@ def main():
     block_size = min(tokenizer.model_max_length, config.block_size)
 
     def group_texts(examples):
-        concatenated = sum(examples["input_ids"], [])
-        total_length = (len(concatenated) // block_size) * block_size
-        result = {
-            "input_ids": [concatenated[i : i + block_size] for i in range(0, total_length, block_size)]
-        }
-        result["labels"] = result["input_ids"].copy()
-        return result
+        # Concatenate and chunk input_ids (and attention_mask if present) into fixed block_size sequences
+        ids = sum(examples["input_ids"], [])
+        total_length = (len(ids) // block_size) * block_size
+        input_blocks = [ids[i : i + block_size] for i in range(0, total_length, block_size)]
+
+        out = {"input_ids": input_blocks}
+
+        if "attention_mask" in examples:
+            am = sum(examples["attention_mask"], [])
+            # Truncate to total_length and reshape to blocks; if shorter, pad with ones
+            if len(am) < total_length:
+                am = am + [1] * (total_length - len(am))
+            am = am[:total_length]
+            mask_blocks = [am[i : i + block_size] for i in range(0, total_length, block_size)]
+            out["attention_mask"] = mask_blocks
+        else:
+            # If no attention_mask provided by tokenizer, synthesize ones
+            out["attention_mask"] = [[1] * block_size for _ in range(len(input_blocks))]
+
+        out["labels"] = input_blocks.copy()
+        return out
 
     lm_datasets = tokenized.map(group_texts, batched=True, num_proc=data_args.preprocessing_num_workers)
 
