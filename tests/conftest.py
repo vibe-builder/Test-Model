@@ -49,7 +49,7 @@ def decoder_config():
 def dca_config():
     """Create DCA-enabled config."""
     config = NanoConfig.from_preset("decoder_tiny")
-    config.use_dca = True
+    config.attention_type = "dca"
     config.dca_attention_budget = 0.5
     return config
 

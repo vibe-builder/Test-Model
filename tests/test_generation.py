@@ -35,7 +35,7 @@ def tiny_model(tiny_config):
 def dca_config():
     """Create a config with DCA enabled for testing."""
     config = NanoConfig.from_preset("decoder_tiny")
-    config.use_dca = True
+    config.attention_type = "dca"
     config.dca_attention_budget = 0.5
     config.dca_local_window = 64
     config.use_torch_compile = False
@@ -252,8 +252,8 @@ def test_generation_with_dca(dca_model, sample_inputs):
 
     # Verify DCA is actually active (check if attention metadata exists)
     # This is a model-specific check that DCA is functioning
-    assert hasattr(dca_model.config, 'use_dca')
-    assert dca_model.config.use_dca == True
+    assert hasattr(dca_model.config, 'attention_type')
+    assert dca_model.config.attention_type == "dca"
 
 
 def test_generation_batch_processing(tiny_model, sample_inputs):

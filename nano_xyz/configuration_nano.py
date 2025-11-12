@@ -64,11 +64,11 @@ class NanoConfig(PretrainedConfig):
         rope_base: float = 10000.0,
         yarn_scale_factor: float = 1.0,
         use_xpos: bool = False,
-        attention_type: str = "dca",
+        attention_type: str = "default",  # "default", "dca", "block_sparse", "full"
         dca_window_size: int = 256,
         dca_global_tokens: int = 32,
         dca_random_blocks: int = 16,
-        dca_enable_generation: bool = True,
+        dca_enable_generation: bool = False,  # Disabled by default for generation coherence
         dca_attention_budget: float = 0.2,
         dca_local_window: int = 128,
         dca_global_budget: int = 64,
@@ -80,13 +80,15 @@ class NanoConfig(PretrainedConfig):
         torch_dtype: Optional[str] = None,
         use_activation_checkpointing: bool = False,
         quantization_config: Optional[Dict[str, Any]] = None,
-        use_dca: bool = False,
         enable_observability: bool = False,
         log_dca_metrics: bool = False,
         pad_token_id: Optional[int] = None,
         eos_token_id: Optional[int] = None,
         bos_token_id: Optional[int] = None,
         tie_word_embeddings: bool = True,
+        # Encoder-decoder specific fields
+        is_decoder: bool = False,
+        add_cross_attention: bool = False,
         **kwargs
     ):
         super().__init__(
@@ -144,8 +146,27 @@ class NanoConfig(PretrainedConfig):
         self.torch_dtype = torch_dtype
         self.use_activation_checkpointing = use_activation_checkpointing
         self.quantization_config = quantization_config
-        self.use_dca = use_dca
         # use_return_dict is handled by parent class
+
+        # Encoder-decoder specific attributes
+        self.is_decoder = is_decoder
+        self.add_cross_attention = add_cross_attention
+
+    @property
+    def use_dca(self) -> bool:
+        """Derived property: DCA is enabled when attention_type includes DCA."""
+        return getattr(self, 'attention_type', 'default') in ["dca", "block_sparse"]
+
+    @use_dca.setter
+    def use_dca(self, value: bool):
+        """Setter for backward compatibility - maps to attention_type."""
+        current_attention_type = getattr(self, 'attention_type', 'default')
+        if value:
+            if current_attention_type == "default":
+                self.attention_type = "dca"
+        else:
+            if current_attention_type in ["dca", "block_sparse"]:
+                self.attention_type = "default"
 
 
     @classmethod
@@ -171,7 +192,7 @@ class NanoConfig(PretrainedConfig):
             },
             "decoder_medium": {
                 "block_size": 4096, "n_layer": 24, "n_head": 16, "n_embd": 1024,
-                "use_dca": True,
+                "attention_type": "dca",
                 "dca_window_size": 1024, "dca_global_tokens": 128, "dca_random_blocks": 64
             },
             "encoder_decoder_tiny": {

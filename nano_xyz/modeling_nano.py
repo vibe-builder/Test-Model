@@ -20,29 +20,21 @@ from transformers.modeling_outputs import (
     Seq2SeqLMOutput,
 )
 
-# Check transformers version for proper imports
-_transformers_version = tuple(map(int, importlib.metadata.version("transformers").split(".")))
-
-# GenerationMixin import - available in transformers >= 4.35.0 in generation.utils
-if _transformers_version >= (4, 35, 0):
+# Simplified imports with graceful fallbacks
+try:
     from transformers.generation.utils import GenerationMixin
-else:
-    # Fallback for older versions
+except ImportError:
     try:
         from transformers.generation import GenerationMixin  # type: ignore
     except ImportError:
-        # Minimal fallback class for basic compatibility
         class GenerationMixin:
-            """Minimal GenerationMixin fallback for older transformers versions."""
+            """Minimal GenerationMixin fallback for basic compatibility."""
             pass
 
-# Auto registration functions - API changed in different versions
-if _transformers_version >= (4, 33, 0):
+try:
+    from transformers.utils import register_for_auto_class
+except ImportError:
     try:
-        # Try the old API first (transformers < 4.48.0)
-        from transformers.utils import register_for_auto_class
-    except ImportError:
-        # New API (transformers >= 4.48.0) - create wrapper functions
         from transformers.models.auto.configuration_auto import AutoConfig
         from transformers.models.auto.modeling_auto import AutoModel, AutoModelForCausalLM
 
@@ -56,12 +48,11 @@ if _transformers_version >= (4, 33, 0):
                     AutoModelForCausalLM.register(cls.model_type, cls)
                 return cls
             return decorator
-else:
-    # Fallback for very old versions
-    def register_for_auto_class(_auto_class: str):  # pragma: no cover
-        def decorator(cls):
-            return cls
-        return decorator
+    except ImportError:
+        def register_for_auto_class(_auto_class: str):
+            def decorator(cls):
+                return cls
+            return decorator
 
 from .configuration_nano import NanoConfig
 from .base import NanoPreTrainedModel
@@ -72,9 +63,12 @@ logger = logging.getLogger(__name__)
 
 
 # Register the configuration class
-if _transformers_version >= (4, 33, 0):
+try:
+    from transformers.models.auto.configuration_auto import AutoConfig
     from .configuration_nano import NanoConfig
     AutoConfig.register("nano", NanoConfig)
+except ImportError:
+    pass  # Registration not available in older versions
 
 
 @register_for_auto_class("AutoModelForCausalLM")
@@ -87,6 +81,17 @@ class NanoForCausalLM(NanoPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = NanoModel(config)
         self.lm_head = self.model.lm_head
+
+        # Apply quantization immediately during initialization if configured
+        # This ensures consistent behavior and avoids lazy quantization issues
+        if config.quantization_config and hasattr(self.model, 'quantize_model'):
+            try:
+                self.model.quantize_model()
+                logger.info(f"Applied quantization during model initialization: {config.quantization_config.get('method', 'unknown')}")
+            except Exception as e:
+                logger.warning(f"Failed to apply quantization during initialization: {e}")
+                # Continue without quantization rather than failing
+
         self.post_init()
 
     def forward(
@@ -104,19 +109,6 @@ class NanoForCausalLM(NanoPreTrainedModel, GenerationMixin):
         return_dict = kwargs.pop("return_dict", self.config.use_return_dict)
 
         effective_use_cache = use_cache
-
-        # Apply dynamic quantization for inference if configured
-        # Quantization is applied lazily on first inference call
-        if (self.config.quantization_config and
-            hasattr(self.model, 'quantize_model') and
-            not self.training):
-            # Check if model has already been quantized (avoid re-quantizing)
-            if not hasattr(self, '_quantized_applied'):
-                try:
-                    self.model.quantize_model()
-                    self._quantized_applied = True
-                except Exception as e:
-                    logger.warning(f"Failed to apply quantization during inference: {e}")
 
         model_outputs = self.model(
             input_ids=input_ids,
@@ -462,9 +454,10 @@ class NanoDecoderModel(NanoPreTrainedModel):
 # Encoder-Decoder Model Imports
 from transformers import EncoderDecoderModel as HFEncoderDecoderModel
 from .configuration_nano import NanoConfig
+from .base import NanoPreTrainedModel
 
 
-class NanoEncoderDecoderModel(nn.Module):
+class NanoEncoderDecoderModel(NanoPreTrainedModel, GenerationMixin):
     """
     Nano XYZ Encoder-Decoder model for sequence-to-sequence tasks.
 
@@ -477,6 +470,8 @@ class NanoEncoderDecoderModel(nn.Module):
     Supports HuggingFace generate() methods with proper attention mask handling.
     """
 
+    _keys_to_ignore_on_save = ["encoder.embed_tokens.weight", "decoder.embed_tokens.weight", "decoder.lm_head.weight"]
+
     def __init__(self, config: NanoConfig):
         """
         Initialize encoder-decoder model.
@@ -484,7 +479,7 @@ class NanoEncoderDecoderModel(nn.Module):
         Args:
             config: NanoConfig with encoder/decoder specifications
         """
-        super().__init__()
+        super().__init__(config)
 
         # Create separate configs for encoder and decoder
         encoder_config = NanoConfig(**config.__dict__)
@@ -503,6 +498,10 @@ class NanoEncoderDecoderModel(nn.Module):
         if config.tie_word_embeddings:
             self.decoder.embed_tokens = self.encoder.embed_tokens
 
+        # Set up model parallel if needed (placeholder for future distributed training)
+        self.model_parallel = False
+        self.device_map = None
+
     def get_encoder(self):
         """Get the encoder model."""
         return self.encoder
@@ -516,7 +515,11 @@ class NanoEncoderDecoderModel(nn.Module):
         input_ids=None,
         attention_mask=None,
         decoder_input_ids=None,
+        decoder_attention_mask=None,
         labels=None,
+        output_hidden_states=None,
+        output_attentions=None,
+        return_dict=None,
         **kwargs
     ):
         """
@@ -526,28 +529,59 @@ class NanoEncoderDecoderModel(nn.Module):
             input_ids: Encoder input token ids [batch, seq_len]
             attention_mask: Encoder attention mask [batch, seq_len]
             decoder_input_ids: Decoder input token ids [batch, seq_len]
+            decoder_attention_mask: Decoder attention mask [batch, seq_len]
             labels: Target labels for loss computation [batch, seq_len]
+            output_hidden_states: Whether to return hidden states
+            output_attentions: Whether to return attentions
+            return_dict: Whether to return dict or tuple
 
         Returns:
-            ModelOutput with last_hidden_state, loss, etc.
+            Seq2SeqLMOutput with logits, loss, encoder/decoder outputs, etc.
         """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
         # Encode input sequence
         encoder_outputs = self.encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            return_dict=True,
             **kwargs
         )
 
         # Decode with cross-attention to encoder outputs
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
-            encoder_hidden_states=encoder_outputs.last_hidden_state,
+            encoder_outputs=encoder_outputs.last_hidden_state,
             encoder_attention_mask=attention_mask,
+            attention_mask=decoder_attention_mask,
             labels=labels,
+            output_hidden_states=output_hidden_states,
             **kwargs
         )
 
-        return decoder_outputs
+        if not return_dict:
+            # Return tuple format for backward compatibility
+            outputs = (decoder_outputs["logits"],) + (encoder_outputs.last_hidden_state,)
+            if "loss" in decoder_outputs:
+                outputs = (decoder_outputs["loss"],) + outputs
+            return outputs
+
+        # Return Seq2SeqLMOutput
+        from transformers.modeling_outputs import Seq2SeqLMOutput
+
+        return Seq2SeqLMOutput(
+            loss=decoder_outputs.get("loss"),
+            logits=decoder_outputs.get("logits"),
+            past_key_values=decoder_outputs.get("past_key_values"),
+            decoder_hidden_states=decoder_outputs.get("hidden_states"),
+            decoder_attentions=None,  # Not implemented yet
+            cross_attentions=None,  # Not implemented yet
+            encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+            encoder_hidden_states=encoder_outputs.hidden_states,
+            encoder_attentions=encoder_outputs.attentions,
+        )
 
     def prepare_inputs_for_generation(
         self,
@@ -602,4 +636,140 @@ class NanoEncoderDecoderModel(nn.Module):
             self.decoder.lm_head.weight = encoder_embeds.weight
 
         return encoder_embeds
+
+
+@register_for_auto_class("AutoModelForSeq2SeqLM")
+class NanoEncoderDecoderModelForSeq2SeqLM(NanoEncoderDecoderModel, GenerationMixin):
+        """
+        Nano XYZ Encoder-Decoder model for sequence-to-sequence generation tasks.
+
+        This is the main class for seq2seq tasks like translation, summarization, etc.
+        Supports HuggingFace generate() methods with proper encoder-decoder handling.
+        """
+
+        _keys_to_ignore_on_save = ["encoder.embed_tokens.weight", "decoder.embed_tokens.weight", "lm_head.weight"]
+
+        def __init__(self, config: NanoConfig):
+            super().__init__(config)
+            # LM head is already created in the decoder
+            self.lm_head = self.decoder.lm_head
+
+            # Apply quantization immediately during initialization if configured
+            # This ensures consistent behavior for encoder-decoder models
+            if config.quantization_config:
+                try:
+                    # Quantize both encoder and decoder
+                    if hasattr(self.encoder, 'quantize_model'):
+                        self.encoder.quantize_model()
+                    if hasattr(self.decoder, 'quantize_model'):
+                        self.decoder.quantize_model()
+                    logger.info(f"Applied quantization to encoder-decoder model during initialization: {config.quantization_config.get('method', 'unknown')}")
+                except Exception as e:
+                    logger.warning(f"Failed to apply quantization to encoder-decoder model during initialization: {e}")
+                    # Continue without quantization rather than failing
+
+        def forward(
+            self,
+            input_ids=None,
+            attention_mask=None,
+            decoder_input_ids=None,
+            decoder_attention_mask=None,
+            labels=None,
+            output_hidden_states=None,
+            output_attentions=None,
+            return_dict=None,
+            **kwargs
+        ):
+            """
+            Forward pass with generation-compatible outputs.
+            """
+            outputs = super().forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                decoder_input_ids=decoder_input_ids,
+                decoder_attention_mask=decoder_attention_mask,
+                labels=labels,
+                output_hidden_states=output_hidden_states,
+                output_attentions=output_attentions,
+                return_dict=return_dict,
+                **kwargs
+            )
+
+            # For generation compatibility, ensure we have the right structure
+            if return_dict and hasattr(outputs, 'logits'):
+                # Add past_key_values in the right format for generation
+                if hasattr(outputs, 'past_key_values') and outputs.past_key_values is not None:
+                    # Convert list to tuple format expected by generation
+                    if isinstance(outputs.past_key_values, list):
+                        outputs.past_key_values = tuple(outputs.past_key_values)
+
+            return outputs
+
+        def prepare_inputs_for_generation(
+            self,
+            decoder_input_ids,
+            past_key_values=None,
+            attention_mask=None,
+            decoder_attention_mask=None,
+            encoder_outputs=None,
+            **kwargs
+        ):
+            """
+            Prepare inputs for generation step.
+            """
+            # encoder_outputs should be passed as keyword argument
+            if encoder_outputs is None:
+                raise ValueError("encoder_outputs must be provided for encoder-decoder generation")
+
+            return {
+                "input_ids": None,  # Encoder inputs already processed
+                "encoder_outputs": encoder_outputs,
+                "past_key_values": past_key_values,
+                "decoder_input_ids": decoder_input_ids,
+                "attention_mask": attention_mask,
+                "decoder_attention_mask": decoder_attention_mask,
+                **kwargs,
+            }
+
+        def prepare_decoder_input_ids_from_labels(self, labels: torch.Tensor):
+            """
+            Prepare decoder input ids from labels for teacher forcing.
+            """
+            return self._shift_right(labels)
+
+        def _shift_right(self, input_ids):
+            """
+            Shift input ids one position to the right for decoder input.
+            """
+            decoder_start_token_id = getattr(self.config, 'decoder_start_token_id', self.config.bos_token_id)
+            if decoder_start_token_id is None:
+                decoder_start_token_id = self.config.bos_token_id
+
+            if decoder_start_token_id is None:
+                raise ValueError(
+                    "decoder_start_token_id or bos_token_id must be defined for encoder-decoder generation"
+                )
+
+            shifted_input_ids = input_ids.new_zeros(input_ids.shape)
+            shifted_input_ids[..., 1:] = input_ids[..., :-1].clone()
+            shifted_input_ids[..., 0] = decoder_start_token_id
+
+            return shifted_input_ids
+
+        def get_encoder(self):
+            """Get encoder for generation."""
+            return self.encoder
+
+        def get_decoder(self):
+            """Get decoder for generation."""
+            return self.decoder
+
+        def get_output_embeddings(self):
+            """Get output embeddings (LM head)."""
+            return self.lm_head
+
+        def set_output_embeddings(self, new_embeddings):
+            """Set output embeddings."""
+            self.lm_head = new_embeddings
+            self.decoder.lm_head = new_embeddings
 

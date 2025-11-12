@@ -1,22 +1,24 @@
 # Nano XYZ Model - Adaptive Computation Transformer with DCA
 # ============================================================
 #
-# Revolutionary approach to long-context language modeling that solves the universal
-# scaling problem: How to handle arbitrarily long contexts without exponential costs.
+# Efficient approach to long-context language modeling that addresses scaling challenges
+# through intelligent attention budget allocation and optimized architectures.
 #
 # Key Innovations:
 # - Dynamic Context Allocation (DCA): Intelligently allocates attention budget based on content importance
 # - Feedforward Networks: Optimized SwiGLU activation with proper normalization
-# - Memory-Efficient Scaling: Handles 100K+ tokens on consumer GPUs
-# - Sparse Attention: Only attends to high-priority tokens
+# - Memory-Efficient Scaling: Handles 50K+ tokens on consumer GPUs
+# - Sparse Attention: Only attends to high-priority tokens for long contexts
+# - Multi-Architecture Support: Decoder-only, Encoder-Decoder, and Encoder-only models
 #
 # Core Features:
 # - Transformer Layers: Standard attention + feedforward architecture
-# - FlashAttention/SDPA: Optimized attention mechanisms for speed
+# - PyTorch SDPA: Optimized attention mechanisms for compatibility
 # - Rotary Position Encoding (RoPE): Better positional understanding
 # - YaRN scaling: Extends context length beyond training limits
-# - Quantization support: 4-bit and 8-bit quantization with bitsandbytes
+# - TorchAO Quantization: Dynamic quantization for 2-4x inference speedup
 # - Gradient checkpointing: Memory-efficient training
+# - Comprehensive Input Validation: Runtime safety checks
 #
 # Architecture: Transformer with DCA attention, SwiGLU feed-forward, and RMSNorm.
 
@@ -85,7 +87,7 @@ allowing trained models to handle sequences longer than training length.
 xPos [5] provides improved extrapolation by scaling based on embedding position.
 
 Citation [4]: YaRN - extends RoPE to handle 64K+ tokens
-Source: https://arxiv.org/html/2511.01192v1
+Source: https://arxiv.org/abs/2309.00071
 Layman explanation: YaRN is like stretching a rubber band - it lets the model
 handle longer texts by smoothly extending the position encoding pattern.
 
@@ -288,6 +290,30 @@ class AttentionLayer(nn.Module):
         """
         Forward pass with support for DCA, cross-attention, and KV caching.
         """
+        # Input validation for attention layer
+        if not isinstance(hidden_states, torch.Tensor):
+            raise TypeError(f"`hidden_states` must be a torch.Tensor, got {type(hidden_states)}")
+        if hidden_states.dim() != 3:
+            raise ValueError(f"`hidden_states` must be 3D [batch_size, seq_len, hidden_size], got shape {hidden_states.shape}")
+        if hidden_states.size(-1) != self.n_embd:
+            raise ValueError(f"`hidden_states` hidden_size {hidden_states.size(-1)} must match n_embd {self.n_embd}")
+
+        if attention_mask is not None:
+            if not isinstance(attention_mask, torch.Tensor):
+                raise TypeError(f"`attention_mask` must be a torch.Tensor, got {type(attention_mask)}")
+
+        if position_ids is not None:
+            if not isinstance(position_ids, torch.Tensor):
+                raise TypeError(f"`position_ids` must be a torch.Tensor, got {type(position_ids)}")
+
+        if encoder_hidden_states is not None:
+            if not isinstance(encoder_hidden_states, torch.Tensor):
+                raise TypeError(f"`encoder_hidden_states` must be a torch.Tensor, got {type(encoder_hidden_states)}")
+            if encoder_hidden_states.dim() != 3:
+                raise ValueError(f"`encoder_hidden_states` must be 3D [batch_size, src_len, hidden_size], got shape {encoder_hidden_states.shape}")
+            if encoder_hidden_states.size(-1) != self.n_embd:
+                raise ValueError(f"`encoder_hidden_states` hidden_size {encoder_hidden_states.size(-1)} must match n_embd {self.n_embd}")
+
         batch, seq_len, _ = hidden_states.shape
 
         past_length = get_past_key_values_length(past_key_value)
@@ -301,8 +327,8 @@ class AttentionLayer(nn.Module):
         is_generation_mode = past_key_value is not None
         dca_allowed_in_generation = self.config.dca_enable_generation
 
-        # Warn about experimental DCA generation usage
-        if is_generation_mode and dca_allowed_in_generation and self.config.use_dca:
+        # Warn about experimental DCA generation usage only when not explicitly enabled
+        if is_generation_mode and not dca_allowed_in_generation and self.config.use_dca:
             import warnings
             import inspect
 
@@ -324,8 +350,9 @@ class AttentionLayer(nn.Module):
             warnings.warn(
                 "DCA during autoregressive generation is experimental and may produce incoherent outputs. "
                 "Sparse attention patterns are designed for complete sequence processing, not incremental "
-                "token-by-token generation. Consider disabling DCA during generation by setting "
-                "dca_enable_generation=False in config.",
+                "token-by-token generation. DCA is currently enabled during generation. To suppress this "
+                "warning, set dca_enable_generation=True in config, or disable DCA entirely by setting "
+                "use_dca=False.",
                 UserWarning,
                 stacklevel=stacklevel
             )
@@ -337,8 +364,8 @@ class AttentionLayer(nn.Module):
         )
 
         # Standard attention path with DCA and cross-attention support
-        # Handle cross-attention first (decoder only)
-        if encoder_hidden_states is not None and self.is_decoder:
+        # Handle cross-attention for decoder layers when encoder_hidden_states provided
+        if encoder_hidden_states is not None:
             # Cross-attention to encoder outputs
             q_cross = self.q_proj_cross(hidden_states)
             k_cross = self.k_proj_cross(encoder_hidden_states)
@@ -497,16 +524,27 @@ class TransformerLayer(nn.Module):
         super().__init__()
         self.is_encoder = is_encoder
         self.is_decoder = is_decoder
-        # Each layer has attention to understand relationships
-        # For encoders: is_decoder=False, is_encoder=True (no cross-attention projections)
-        # For decoders: is_decoder=True, is_encoder=False (includes cross-attention projections)
-        # For decoder-only: is_decoder=False, is_encoder=False (standard attention)
-        self.self_attn = AttentionLayer(config, layer_idx, linear_factory, is_decoder=is_decoder, is_encoder=is_encoder)
+
+        # Attention layers depend on architecture
+        if is_encoder:
+            # Encoder: only self-attention (bidirectional)
+            self.self_attn = AttentionLayer(config, layer_idx, linear_factory, is_decoder=False, is_encoder=True)
+        elif is_decoder:
+            # Decoder: self-attention + cross-attention
+            self.self_attn = AttentionLayer(config, layer_idx, linear_factory, is_decoder=True, is_encoder=False)
+            self.cross_attn = AttentionLayer(config, layer_idx, linear_factory, is_decoder=True, is_encoder=False)
+        else:
+            # Decoder-only: standard self-attention
+            self.self_attn = AttentionLayer(config, layer_idx, linear_factory, is_decoder=False, is_encoder=False)
 
         # Standard feedforward network
         self.feedforward = SwiGLU(config, linear_factory)
         self.input_layernorm = nn.RMSNorm(config.n_embd)
         self.post_attention_layernorm = nn.RMSNorm(config.n_embd)
+
+        # Additional layernorm for decoder cross-attention
+        if is_decoder:
+            self.post_cross_attention_layernorm = nn.RMSNorm(config.n_embd)
 
     def forward(
         self,
@@ -520,17 +558,57 @@ class TransformerLayer(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,  # For cross-attention
         encoder_attention_mask: Optional[torch.Tensor] = None,  # For cross-attention masking
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        attn_output, attn_weights, past_key_value = self.self_attn(
-            hidden_states, attention_mask, position_ids, past_key_value, output_attentions, use_cache, query_position, not self.is_encoder,
-            encoder_hidden_states, encoder_attention_mask
-        )
-        hidden_states = residual + attn_output
+        if self.is_encoder:
+            # Encoder: only self-attention (bidirectional)
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+            attn_output, attn_weights, _ = self.self_attn(
+                hidden_states, attention_mask, position_ids, None, output_attentions, False, query_position, False
+            )
+            hidden_states = residual + attn_output
 
+        elif self.is_decoder:
+            # Decoder: self-attention + cross-attention + feedforward (T5/BART style)
+            # 1. Causal self-attention
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+            self_attn_output, self_attn_weights, past_key_value = self.self_attn(
+                hidden_states, attention_mask, position_ids, past_key_value, output_attentions, use_cache, query_position, True
+            )
+            hidden_states = residual + self_attn_output
+
+            # 2. Cross-attention (if encoder states provided)
+            if encoder_hidden_states is not None:
+                residual = hidden_states
+                hidden_states = self.post_attention_layernorm(hidden_states)
+                cross_attn_output, cross_attn_weights, _ = self.cross_attn(
+                    hidden_states, None, None, None, output_attentions, False, query_position, False,
+                    encoder_hidden_states, encoder_attention_mask
+                )
+                hidden_states = residual + cross_attn_output
+
+                # Use cross-attention weights if requested
+                attn_weights = cross_attn_weights if output_attentions else None
+            else:
+                attn_weights = self_attn_weights if output_attentions else None
+
+        else:
+            # Decoder-only: standard self-attention
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+            attn_output, attn_weights, past_key_value = self.self_attn(
+                hidden_states, attention_mask, position_ids, past_key_value, output_attentions, use_cache, query_position, not self.is_encoder
+            )
+            hidden_states = residual + attn_output
+
+        # Feedforward network (applied to all architectures)
         residual = hidden_states
-        # Apply normalization before feedforward
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        if self.is_decoder and encoder_hidden_states is not None:
+            # For decoder with cross-attention, use post_cross_attention_layernorm
+            hidden_states = self.post_cross_attention_layernorm(hidden_states)
+        else:
+            # For encoder or decoder-only, use post_attention_layernorm
+            hidden_states = self.post_attention_layernorm(hidden_states)
 
         # Standard feedforward network
         hidden_states = self.feedforward(hidden_states)
@@ -591,6 +669,7 @@ class NanoEncoder(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         output_hidden_states: bool = False,
+        output_attentions: Optional[bool] = None,
         return_dict: bool = True,
     ) -> Union[torch.Tensor, ModelOutput]:
         """Encode input sequence into contextual representations.
@@ -1041,6 +1120,143 @@ class NanoModel(NanoPreTrainedModel):
 
         return compile_config
 
+    def _validate_inputs(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        cache_position=None,
+        decoder_input_ids=None,
+        decoder_attention_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        labels=None,
+    ):
+        """
+        Comprehensive input validation for NanoModel forward pass.
+
+        Validates tensor shapes, dtypes, and compatibility to prevent runtime errors.
+        """
+        # Validate input_ids vs inputs_embeds exclusivity
+        if input_ids is None and inputs_embeds is None:
+            raise ValueError("Either `input_ids` or `inputs_embeds` must be provided")
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("Cannot specify both `input_ids` and `inputs_embeds`")
+
+        # Validate input_ids
+        if input_ids is not None:
+            if not isinstance(input_ids, torch.Tensor):
+                raise TypeError(f"`input_ids` must be a torch.Tensor, got {type(input_ids)}")
+            if input_ids.dtype not in (torch.int32, torch.int64, torch.long):
+                raise ValueError(f"`input_ids` must have integer dtype, got {input_ids.dtype}")
+            if input_ids.dim() != 2:
+                raise ValueError(f"`input_ids` must be 2D [batch_size, seq_len], got shape {input_ids.shape}")
+            if input_ids.numel() == 0:
+                raise ValueError("`input_ids` cannot be empty")
+
+        # Validate inputs_embeds
+        if inputs_embeds is not None:
+            if not isinstance(inputs_embeds, torch.Tensor):
+                raise TypeError(f"`inputs_embeds` must be a torch.Tensor, got {type(inputs_embeds)}")
+            if inputs_embeds.dtype not in (torch.float16, torch.float32, torch.bfloat16):
+                raise ValueError(f"`inputs_embeds` must have floating point dtype, got {inputs_embeds.dtype}")
+            if inputs_embeds.dim() != 3:
+                raise ValueError(f"`inputs_embeds` must be 3D [batch_size, seq_len, hidden_size], got shape {inputs_embeds.shape}")
+            if inputs_embeds.size(-1) != self.config.n_embd:
+                raise ValueError(f"`inputs_embeds` hidden_size {inputs_embeds.size(-1)} must match config n_embd {self.config.n_embd}")
+
+        # Validate attention_mask
+        if attention_mask is not None:
+            if not isinstance(attention_mask, torch.Tensor):
+                raise TypeError(f"`attention_mask` must be a torch.Tensor, got {type(attention_mask)}")
+
+            # During generation with past_key_values, attention_mask can be longer than input_ids
+            # as it needs to cover the full context (past + current)
+            current_seq_len = input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]
+            past_length = get_past_key_values_length(past_key_values) if past_key_values is not None else 0
+            expected_min_shape = (input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0], current_seq_len)
+            expected_max_shape = (input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0], past_length + current_seq_len)
+
+            # Allow attention_mask to be either the current sequence length or the full context length
+            if attention_mask.shape[0] != expected_min_shape[0]:
+                raise ValueError(f"`attention_mask` batch size {attention_mask.shape[0]} must match input batch size {expected_min_shape[0]}")
+
+            if not (expected_min_shape[1] <= attention_mask.shape[1] <= expected_max_shape[1]):
+                raise ValueError(f"`attention_mask` sequence length {attention_mask.shape[1]} must be between {expected_min_shape[1]} and {expected_max_shape[1]} (current: {current_seq_len}, past: {past_length})")
+
+        # Validate position_ids
+        if position_ids is not None:
+            if not isinstance(position_ids, torch.Tensor):
+                raise TypeError(f"`position_ids` must be a torch.Tensor, got {type(position_ids)}")
+            if position_ids.dtype not in (torch.int32, torch.int64, torch.long):
+                raise ValueError(f"`position_ids` must have integer dtype, got {position_ids.dtype}")
+            expected_shape = input_ids.shape if input_ids is not None else inputs_embeds.shape[:2]
+            if position_ids.shape != expected_shape:
+                raise ValueError(f"`position_ids` shape {position_ids.shape} must match input shape {expected_shape}")
+
+        # Validate past_key_values
+        if past_key_values is not None:
+            if not isinstance(past_key_values, (list, tuple)):
+                raise TypeError(f"`past_key_values` must be a list or tuple, got {type(past_key_values)}")
+            if len(past_key_values) != self.config.n_layer:
+                raise ValueError(f"`past_key_values` length {len(past_key_values)} must match n_layer {self.config.n_layer}")
+            for i, layer_past in enumerate(past_key_values):
+                if not isinstance(layer_past, (list, tuple)) or len(layer_past) != 2:
+                    raise ValueError(f"`past_key_values[{i}]` must be a tuple of (key, value) tensors")
+                k, v = layer_past
+                if not isinstance(k, torch.Tensor) or not isinstance(v, torch.Tensor):
+                    raise ValueError(f"`past_key_values[{i}]` must contain torch.Tensor objects")
+
+        # Validate cache_position
+        if cache_position is not None:
+            if not isinstance(cache_position, torch.Tensor):
+                raise TypeError(f"`cache_position` must be a torch.Tensor, got {type(cache_position)}")
+            if cache_position.dtype not in (torch.int32, torch.int64, torch.long):
+                raise ValueError(f"`cache_position` must have integer dtype, got {cache_position.dtype}")
+
+        # Validate decoder inputs (for encoder-decoder)
+        if decoder_input_ids is not None:
+            if not isinstance(decoder_input_ids, torch.Tensor):
+                raise TypeError(f"`decoder_input_ids` must be a torch.Tensor, got {type(decoder_input_ids)}")
+            if decoder_input_ids.dtype not in (torch.int32, torch.int64, torch.long):
+                raise ValueError(f"`decoder_input_ids` must have integer dtype, got {decoder_input_ids.dtype}")
+            if decoder_input_ids.dim() != 2:
+                raise ValueError(f"`decoder_input_ids` must be 2D [batch_size, seq_len], got shape {decoder_input_ids.shape}")
+
+        if decoder_attention_mask is not None:
+            if not isinstance(decoder_attention_mask, torch.Tensor):
+                raise TypeError(f"`decoder_attention_mask` must be a torch.Tensor, got {type(decoder_attention_mask)}")
+            if decoder_input_ids is not None and decoder_attention_mask.shape != decoder_input_ids.shape:
+                raise ValueError(f"`decoder_attention_mask` shape {decoder_attention_mask.shape} must match decoder_input_ids shape {decoder_input_ids.shape}")
+
+        # Validate encoder inputs (for cross-attention)
+        if encoder_hidden_states is not None:
+            if not isinstance(encoder_hidden_states, torch.Tensor):
+                raise TypeError(f"`encoder_hidden_states` must be a torch.Tensor, got {type(encoder_hidden_states)}")
+            if encoder_hidden_states.dim() != 3:
+                raise ValueError(f"`encoder_hidden_states` must be 3D [batch_size, src_len, hidden_size], got shape {encoder_hidden_states.shape}")
+            if encoder_hidden_states.size(-1) != self.config.n_embd:
+                raise ValueError(f"`encoder_hidden_states` hidden_size {encoder_hidden_states.size(-1)} must match config n_embd {self.config.n_embd}")
+
+        if encoder_attention_mask is not None:
+            if not isinstance(encoder_attention_mask, torch.Tensor):
+                raise TypeError(f"`encoder_attention_mask` must be a torch.Tensor, got {type(encoder_attention_mask)}")
+            if encoder_hidden_states is not None and encoder_attention_mask.shape[:2] != encoder_hidden_states.shape[:2]:
+                raise ValueError(f"`encoder_attention_mask` shape {encoder_attention_mask.shape} must match encoder_hidden_states shape {encoder_hidden_states.shape[:2]}")
+
+        # Validate labels
+        if labels is not None:
+            if not isinstance(labels, torch.Tensor):
+                raise TypeError(f"`labels` must be a torch.Tensor, got {type(labels)}")
+            if labels.dtype not in (torch.int32, torch.int64, torch.long):
+                raise ValueError(f"`labels` must have integer dtype, got {labels.dtype}")
+            # Labels should match the target sequence (decoder_input_ids or input_ids)
+            target_ids = decoder_input_ids if decoder_input_ids is not None else input_ids
+            if target_ids is not None and labels.shape != target_ids.shape:
+                raise ValueError(f"`labels` shape {labels.shape} must match target sequence shape {target_ids.shape}")
+
     def _is_compilation_supported(self) -> bool:
         """
         Check if torch.compile is supported on this platform.
@@ -1095,6 +1311,21 @@ class NanoModel(NanoPreTrainedModel):
         encoder_attention_mask: Optional[torch.Tensor] = None,  # Encoder attention mask
         labels: Optional[torch.Tensor] = None,  # Labels for loss computation
     ) -> Union[Tuple, ModelOutput, Dict[str, torch.Tensor]]:
+        # Comprehensive input validation
+        self._validate_inputs(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            cache_position=cache_position,
+            decoder_input_ids=decoder_input_ids,
+            decoder_attention_mask=decoder_attention_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            labels=labels,
+        )
+
         # Handle decoder model (with optional cross-attention)
         if getattr(self.config, 'is_decoder', False):
             decoder_input = input_ids

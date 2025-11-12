@@ -22,6 +22,7 @@ try:
     AO_AVAILABLE = True
 except ImportError:
     AO_AVAILABLE = False
+    ao = None
     logger.warning("torch.ao.quantization not available. Dynamic quantization disabled.")
 
 
@@ -197,11 +198,10 @@ class LinearFactory:
 
         Supports both int8_dyn_act_int4_weight and float8_dyn_act_float8_weight configurations.
         """
-        # Import torchao quantization
-        try:
-            import torchao.quantization as ao_quant
-        except ImportError:
-            raise ImportError("torchao required for torchao quantization")
+        # Import torch.ao quantization
+        if not AO_AVAILABLE or ao is None:
+            raise ImportError("torch.ao.quantization required for torch.ao quantization")
+        ao_quant = ao
 
         # Start with standard linear layer
         linear = nn.Linear(in_features, out_features, bias=bias)
@@ -220,7 +220,7 @@ class LinearFactory:
             # quantize_ modifies linear in-place, so we can return it directly
         except Exception as e:
             # Fallback to standard linear if quantization fails
-            print(f"Warning: TorchAO quantization failed ({e}), using standard linear")
+            logger.warning(f"TorchAO quantization failed ({e}), using standard linear")
             return linear
 
         # Perform dynamic calibration to set scales
@@ -236,7 +236,7 @@ class LinearFactory:
             with torch.no_grad():
                 linear(calibration_data)
         except Exception as e:
-            print(f"Warning: Calibration failed ({e}), proceeding without")
+            logger.warning(f"Calibration failed ({e}), proceeding without")
 
         return linear
 

@@ -7,6 +7,11 @@ Optimizations:
 - Use torch.expand + reshape for repeat_kv (15% faster on bfloat16 [3])
 - DCA: Scales attention to 100K+ tokens while maintaining efficiency
 - Always uses PyTorch SDPA for compatibility with sparse attention patterns
+
+Error Handling:
+- Comprehensive input validation for all attention operations
+- Graceful fallbacks for GPU memory issues
+- Structured logging for debugging and monitoring
 """
 
 from __future__ import annotations
@@ -17,6 +22,9 @@ from typing import Callable, Dict, Optional, Tuple
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Simplified attention backend - always use SDPA for compatibility with DCA
 
@@ -206,10 +214,14 @@ class SparsePatternGenerator(nn.Module):
         # Random sparse connections for diversity
         random_mask = torch.zeros(seq_len, seq_len, device=device, dtype=torch.bool)
         if self.random_blocks > 0:
-            # Generate random indices for each row
-            for i in range(seq_len):
-                random_indices = torch.randperm(seq_len, device=device)[:self.random_blocks]
-                random_mask[i, random_indices] = True
+            # Vectorized random selection for all rows at once
+            # Generate random permutation matrix and select top-k per row
+            rand_matrix = torch.rand(seq_len, seq_len, device=device)
+            # Get indices of top-k random values per row
+            _, topk_indices = torch.topk(rand_matrix, self.random_blocks, dim=1)
+            # Create boolean mask by scattering True values
+            rows = torch.arange(seq_len, device=device).unsqueeze(1).expand(-1, self.random_blocks)
+            random_mask[rows.flatten(), topk_indices.flatten()] = True
 
         # Combine all patterns
         mask = local_mask | global_mask | random_mask
@@ -308,10 +320,11 @@ class DynamicContextAllocator(nn.Module):
                 else:  # Ample memory
                     tuned_size = min(128, max(32, seq_len_placeholder // 64))
 
+                logger.debug(f"Auto-tuned block size: {tuned_size} (free GPU memory: {free_gb:.1f}GB)")
                 return max(16, min(tuned_size, base_block_size * 2))  # Don't exceed 2x base size
-            except Exception:
+            except Exception as e:
+                logger.warning(f"GPU memory check failed ({e}), using default block size")
                 # Fallback to base size if memory check fails
-                pass
 
         return base_block_size
 
@@ -355,8 +368,19 @@ class DynamicContextAllocator(nn.Module):
             selected_mask: [batch, seq_len] - which tokens participate in attention
             attention_metadata: Statistics about the allocation
         """
+        # Input validation
+        if not isinstance(hidden_states, torch.Tensor):
+            raise TypeError(f"hidden_states must be torch.Tensor, got {type(hidden_states)}")
+        if hidden_states.dim() != 3:
+            raise ValueError(f"hidden_states must be 3D [batch, seq_len, hidden_size], got shape {hidden_states.shape}")
+        if hidden_states.size(-1) != self.config.n_embd:
+            raise ValueError(f"hidden_states hidden_size {hidden_states.size(-1)} must match config n_embd {self.config.n_embd}")
+
         batch_size, seq_len, _ = hidden_states.shape
         device = hidden_states.device
+
+        # Log DCA activation for monitoring
+        logger.debug(f"DCA forward: batch_size={batch_size}, seq_len={seq_len}, device={device}")
 
         # Apply hardware-aware auto-tuning if enabled
         if getattr(self.config, 'auto_tune_blocks', False):

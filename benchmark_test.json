@@ -1,0 +1,19 @@
+{
+  "model_size": "tiny",
+  "sequence_length": 512,
+  "batch_size": 1,
+  "latency": {
+    "mean_latency_ms": 116.02919006347656,
+    "std_latency_ms": 2.344834089279175,
+    "min_latency_ms": 111.7301025390625,
+    "max_latency_ms": 118.88265991210938,
+    "median_latency_ms": 116.09220886230469,
+    "throughput_tokens_per_sec": 4412.682702687988
+  },
+  "memory": {
+    "baseline_memory_gb": 0.0,
+    "peak_memory_gb": 0.0,
+    "memory_increase_gb": 0.0,
+    "memory_per_token_gb": 0.0
+  }
+}

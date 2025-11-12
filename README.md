@@ -9,18 +9,21 @@
 
 - **Dynamic Context Allocation (DCA)**: Intelligently allocates attention budget based on content importance
 - **Feedforward Networks**: Optimized SwiGLU activation with proper normalization
-- **Memory-Efficient Scaling**: Handles 100K+ tokens on consumer GPUs (<16GB VRAM)
+- **Memory-Efficient Scaling**: Handles 50K+ tokens on consumer GPUs (<16GB VRAM)
 - **Sparse Attention**: Only attends to priority tokens for long contexts
 - **Dynamic Quantization**: TorchAO integration for 2-4x inference speedup
+- **Encoder-Decoder Architecture**: Complete seq2seq support with bidirectional encoder and causal decoder with cross-attention (T5/BART style)
 
 ## Features
 
 - **Consumer Hardware Optimized**: Tested on RTX 40-series GPUs with <16GB VRAM
 - **Quantization Aware**: TorchAO dynamic quantization with minimal accuracy loss
 - **Sparse Attention**: DCA-based attention for long contexts without OOM
+- **Multi-Architecture Support**: Decoder-only, Encoder-Decoder, and Encoder-only models
 - **Optimized Architecture**: Streamlined transformer with efficient FFN layers
 - **HuggingFace Compatible**: Full integration with transformers ecosystem
 - **Comprehensive Testing**: CI pipeline with performance regression detection
+- **Long Context Support**: Validated up to 32K tokens with DCA
 
 ## Quick Start
 
@@ -42,11 +45,20 @@ python scripts/dev.py validate    # Validate model functionality
 
 ## Model Presets
 
-| Preset | Parameters | Context | Use Case |
-|--------|------------|---------|----------|
-| `decoder_tiny` | ~10M | 1K-4K | Development/Testing |
-| `decoder_small` | ~50M | 4K-16K | Consumer Hardware |
-| `decoder_medium` | ~200M | 16K-64K | Workstation |
+| Preset | Parameters | Context | Architecture | Use Case |
+|--------|------------|---------|--------------|----------|
+| `decoder_tiny` | ~10M | 1K-4K | Decoder-only | Development/Testing |
+| `decoder_small` | ~50M | 4K-16K | Decoder-only | Consumer Hardware |
+| `decoder_medium` | ~200M | 16K-64K | Decoder-only | Workstation |
+| `encoder_decoder_tiny` | ~20M | 512-2K | Encoder-Decoder | Seq2Seq Tasks |
+
+## Architectures
+
+- **Decoder-only**: Standard language modeling (GPT-style) with optional DCA for long contexts
+- **Encoder-Decoder**: Complete seq2seq with bidirectional encoder + causal decoder with cross-attention (T5/BART style)
+- **Encoder-only**: Feature extraction and classification with bidirectional attention
+
+All architectures support DCA for efficient long-context processing where applicable.
 
 ## Quantization
 

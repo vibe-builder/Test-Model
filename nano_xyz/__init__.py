@@ -32,7 +32,7 @@ from .configuration_nano import NanoConfig
 from .quantization import QuantizationConfig
 from .base import NanoPreTrainedModel
 from .model import NanoModel, RotaryEmbedding, SwiGLU, TransformerLayer, ModelOutput, NanoEncoder, NanoDecoder
-from .modeling_nano import NanoForCausalLM, NanoEncoderModel, NanoDecoderModel
+from .modeling_nano import NanoForCausalLM, NanoEncoderModel, NanoDecoderModel, NanoEncoderDecoderModel, NanoEncoderDecoderModelForSeq2SeqLM
 from .attention_utils import process_attention_mask
 
 __all__ = [
@@ -49,6 +49,8 @@ __all__ = [
     "NanoForCausalLM",
     "NanoEncoderModel",
     "NanoDecoderModel",
+    "NanoEncoderDecoderModel",
+    "NanoEncoderDecoderModelForSeq2SeqLM",
     "process_attention_mask",
 ]
 

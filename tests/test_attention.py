@@ -26,7 +26,7 @@ def config():
 def dca_config():
     """Create DCA-enabled configuration."""
     config = NanoConfig.from_preset("decoder_tiny")
-    config.use_dca = True
+    config.attention_type = "dca"
     config.dca_attention_budget = 0.5
     config.dca_local_window = 64
     config.dca_global_tokens = 32
@@ -63,7 +63,7 @@ def sample_attention_inputs():
     }
 
 
-@pytest.mark.parametrize("seq_len", [512, 1024, 2048, 4096])
+@pytest.mark.parametrize("seq_len", [512, 1024, 2048, 4096, 8192, 16384, 32768])
 @pytest.mark.parametrize("device_type", ["cpu", "cuda"])
 def test_pattern_generator(pattern_generator, seq_len, device_type):
     """Test jagged pattern generation across different sequence lengths and devices."""
@@ -506,7 +506,7 @@ def test_dilation_functionality(config, dilation_rate):
     """Test that dilation creates the expected sparse attention patterns."""
     # Create config with dilation
     config.dca_dilation_rate = dilation_rate
-    config.use_dca = True
+    config.attention_type = "dca"
 
     # Create DCA allocator
     allocator = DynamicContextAllocator(config)
